@@ -107,6 +107,7 @@ export default function GridPathSolver() {
   const dragMode = useRef<'add' | 'remove' | null>(null);
   const dragSeen = useRef<Set<PointStr>>(new Set());
   const lastTouchTime = useRef<number>(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Resize effect for responsiveness
   useEffect(() => {
@@ -273,6 +274,61 @@ export default function GridPathSolver() {
     setSolution(null);
   };
 
+  const handleImageScan = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setStatus("Scanning image...");
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      
+      ctx.drawImage(img, 0, 0);
+      
+      const newCells = new Set<PointStr>();
+      // Assume grid is centered and takes up ~90% of the image
+      const marginX = img.width * 0.05;
+      const marginY = img.height * 0.05;
+      const usableWidth = img.width - marginX * 2;
+      const usableHeight = img.height - marginY * 2;
+      const cellW = usableWidth / cols;
+      const cellH = usableHeight / rows;
+
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const px = Math.floor(marginX + c * cellW + cellW / 2);
+          const py = Math.floor(marginY + r * cellH + cellH / 2);
+          
+          const pixel = ctx.getImageData(px, py, 1, 1).data;
+          // Calculate brightness (average of RGB)
+          const brightness = (pixel[0] + pixel[1] + pixel[2]) / 3;
+          
+          // Blocks are usually bright on a dark background. Adjust threshold if needed.
+          if (brightness > 60) {
+            newCells.add(toStr({ r, c }));
+          }
+        }
+      }
+      
+      setActiveCells(newCells);
+      setStart(null);
+      setEnd(null);
+      setSolution(null);
+      setStatus(`Scanned! Found ${newCells.size} blocks.`);
+      playSound('solve'); // Play a nice sound on finish
+      URL.revokeObjectURL(url);
+    };
+    
+    img.src = url;
+    e.target.value = ''; // Reset input
+  };
+
   const solve = () => {
     if (activeCells.size === 0) {
       alert("No active cells.");
@@ -339,7 +395,9 @@ export default function GridPathSolver() {
             <button className={`btn join-item ${toolMode === 'paint' ? 'btn-neutral' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('paint')}>✏️ Paint</button>
             <button className={`btn join-item ${toolMode === 'start' ? 'btn-info text-info-content' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('start')}>🔵 Start</button>
             <button className={`btn join-item ${toolMode === 'end' ? 'btn-warning text-warning-content' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('end')}>🟧 End</button>
+            <button className="btn join-item btn-ghost border border-base-300 text-secondary font-semibold" onClick={() => fileInputRef.current?.click()}>📷 Scan</button>
           </div>
+          <input type="file" accept="image/*" capture="environment" ref={fileInputRef} onChange={handleImageScan} className="hidden" />
         </div>
 
         {/* Control Panel */}
