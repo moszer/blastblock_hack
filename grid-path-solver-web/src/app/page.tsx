@@ -115,6 +115,95 @@ export default function GridPathSolver() {
   const animationRef = useRef<number | null>(null);
   const liveCellsRef = useRef<Set<PointStr>>(new Set());
 
+  // Particles state
+  const particleCanvasRef = useRef<HTMLCanvasElement>(null);
+  const particlesRef = useRef<any[]>([]);
+
+  // Particle Loop
+  useEffect(() => {
+    let animId: number;
+    const canvas = particleCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    
+    const resize = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    };
+    resize();
+    window.addEventListener('resize', resize);
+    
+    const loop = () => {
+      if (!ctx) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      
+      for (let i = particlesRef.current.length - 1; i >= 0; i--) {
+        const p = particlesRef.current[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life--;
+        
+        if (p.life <= 0) {
+          particlesRef.current.splice(i, 1);
+          continue;
+        }
+        
+        const alpha = p.life / p.maxLife;
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * alpha, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      
+      animId = requestAnimationFrame(loop);
+    };
+    loop();
+    
+    return () => {
+      cancelAnimationFrame(animId);
+      window.removeEventListener('resize', resize);
+    };
+  }, []);
+
+  const spawnParticles = (x: number, y: number, color: string) => {
+    for (let i = 0; i < 4; i++) {
+      particlesRef.current.push({
+        x: x + (Math.random() - 0.5) * 15,
+        y: y + (Math.random() - 0.5) * 15,
+        vx: (Math.random() - 0.5) * 5,
+        vy: (Math.random() - 0.5) * 5,
+        life: 20 + Math.random() * 20,
+        maxLife: 40,
+        color: color,
+        size: 3 + Math.random() * 5
+      });
+    }
+  };
+
+  useEffect(() => {
+    const handleMove = (e: MouseEvent | TouchEvent) => {
+      if (!dragMode.current) return;
+      let x = 0, y = 0;
+      if ('touches' in e) {
+        x = e.touches[0].clientX;
+        y = e.touches[0].clientY;
+      } else {
+        x = e.clientX;
+        y = e.clientY;
+      }
+      const color = dragMode.current === 'add' ? '#7db8f5' : '#ff4d4f';
+      spawnParticles(x, y, color);
+    };
+
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('touchmove', handleMove);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('touchmove', handleMove);
+    };
+  }, []);
+
   // Resize effect for responsiveness
   useEffect(() => {
     const updateScale = () => {
@@ -441,6 +530,7 @@ export default function GridPathSolver() {
 
   return (
     <div className="min-h-screen p-4 md:p-8 flex flex-col items-center select-none bg-[#1e1f24]" onContextMenu={(e) => e.preventDefault()}>
+      <canvas ref={particleCanvasRef} className="fixed inset-0 pointer-events-none z-[100]" />
       <div className="max-w-4xl w-full">
         <h1 className="text-3xl md:text-4xl font-bold mb-4 md:mb-6 text-center text-primary tracking-tight">Grid Path Solver</h1>
         
