@@ -412,14 +412,24 @@ export default function GridPathSolver() {
       if (ctx) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         
-        const newCells = new Set<PointStr>();
-        // Assume grid takes ~90% of frame
-        const marginX = canvas.width * 0.05;
-        const marginY = canvas.height * 0.05;
-        const usableWidth = canvas.width - marginX * 2;
-        const usableHeight = canvas.height - marginY * 2;
-        const cellW = usableWidth / cols;
-        const cellH = usableHeight / rows;
+        // Calculate a centered box for the grid based on its true aspect ratio
+        const padding = 20;
+        const availableW = canvas.width - padding * 2;
+        const availableH = canvas.height - padding * 2;
+        const gridRatio = cols / rows;
+        
+        let boxW = availableW;
+        let boxH = boxW / gridRatio;
+        
+        if (boxH > availableH) {
+          boxH = availableH;
+          boxW = boxH * gridRatio;
+        }
+        
+        const startX = (canvas.width - boxW) / 2;
+        const startY = (canvas.height - boxH) / 2;
+        const cellW = boxW / cols;
+        const cellH = boxH / rows;
 
         // Draw grid overlay
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
@@ -427,42 +437,68 @@ export default function GridPathSolver() {
         
         for(let r = 0; r <= rows; r++) {
           ctx.beginPath();
-          ctx.moveTo(marginX, marginY + r * cellH);
-          ctx.lineTo(marginX + usableWidth, marginY + r * cellH);
+          ctx.moveTo(startX, startY + r * cellH);
+          ctx.lineTo(startX + boxW, startY + r * cellH);
           ctx.stroke();
         }
         for(let c = 0; c <= cols; c++) {
           ctx.beginPath();
-          ctx.moveTo(marginX + c * cellW, marginY);
-          ctx.lineTo(marginX + c * cellW, marginY + usableHeight);
+          ctx.moveTo(startX + c * cellW, startY);
+          ctx.lineTo(startX + c * cellW, startY + boxH);
           ctx.stroke();
         }
 
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const data = imageData.data;
         
+        // Collect samples to find the adaptive threshold
+        const samples: {r: number, c: number, b: number, px: number, py: number}[] = [];
+        
         for (let r = 0; r < rows; r++) {
           for (let c = 0; c < cols; c++) {
-            const px = Math.floor(marginX + c * cellW + cellW / 2);
-            const py = Math.floor(marginY + r * cellH + cellH / 2);
+            const px = Math.floor(startX + c * cellW + cellW / 2);
+            const py = Math.floor(startY + r * cellH + cellH / 2);
             
             const idx = (py * canvas.width + px) * 4;
             const brightness = (data[idx] + data[idx+1] + data[idx+2]) / 3;
-            
-            if (brightness > 60) {
-              newCells.add(toStr({ r, c }));
-              // Draw highlight for detected cell
-              ctx.fillStyle = 'rgba(61, 139, 253, 0.5)';
-              ctx.fillRect(marginX + c * cellW + 2, marginY + r * cellH + 2, cellW - 4, cellH - 4);
-            }
-            
-            // Draw center sampling dot
-            ctx.fillStyle = '#ff4d4f';
-            ctx.beginPath();
-            ctx.arc(px, py, 2, 0, Math.PI * 2);
-            ctx.fill();
+            samples.push({ r, c, b: brightness, px, py });
           }
         }
+        
+        // Adaptive Thresholding: sort by brightness and find the biggest gap
+        samples.sort((a, b) => a.b - b.b);
+        let maxGap = 0;
+        let threshold = 60; // fallback
+        
+        if (samples.length > 0) {
+          for (let i = 0; i < samples.length - 1; i++) {
+            const gap = samples[i+1].b - samples[i].b;
+            // Ignore gaps at the very extremes (e.g. 1 dead pixel)
+            if (gap > maxGap && i > samples.length * 0.1 && i < samples.length * 0.9) {
+              maxGap = gap;
+              threshold = samples[i].b + gap / 2;
+            }
+          }
+        }
+        
+        const newCells = new Set<PointStr>();
+        
+        for (const s of samples) {
+          // If brightness is above the adaptive threshold, it's a block
+          if (s.b > threshold) {
+            newCells.add(toStr({ r: s.r, c: s.c }));
+            // Draw highlight
+            ctx.fillStyle = 'rgba(61, 139, 253, 0.5)';
+            ctx.fillRect(startX + s.c * cellW + 2, startY + s.r * cellH + 2, cellW - 4, cellH - 4);
+          }
+          
+          // Draw center sampling dot
+          ctx.fillStyle = s.b > threshold ? '#4ade80' : '#ff4d4f';
+          ctx.beginPath();
+          ctx.arc(s.px, s.py, 2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        
         liveCellsRef.current = newCells;
       }
     }
