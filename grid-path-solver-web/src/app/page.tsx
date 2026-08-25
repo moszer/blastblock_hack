@@ -527,13 +527,15 @@ export default function GridPathSolver() {
                   
                   // Styling to match Python desktop app closely
                   let cellClass = "w-12 h-12 rounded-xl cursor-pointer transition-colors duration-200 relative flex items-center justify-center font-bold text-lg ";
+                  let cellStyle: React.CSSProperties = {};
                   
                   if (!isActive) {
                     cellClass += "bg-base-100/10 border border-base-content/5 border-dashed";
                   } else if (isPath) {
-                    cellClass += "bg-[#7db8f5] text-slate-900";
+                    cellClass += "bg-[#7db8f5] text-slate-900 animate-path shadow-lg shadow-[#7db8f5]/40";
+                    cellStyle = { animationDelay: `${pathIndex * 0.05}s`, animationFillMode: 'both' };
                   } else {
-                    cellClass += "bg-[#5f6068] text-white hover:bg-neutral-focus";
+                    cellClass += "bg-[#5f6068] text-white hover:bg-neutral-focus animate-pop shadow-md";
                   }
 
                   return (
@@ -542,6 +544,7 @@ export default function GridPathSolver() {
                       data-r={r}
                       data-c={c}
                       className={cellClass}
+                      style={cellStyle}
                       onMouseDown={(e) => handleCellDown(r, c, e)}
                       onMouseEnter={() => handleCellEnter(r, c)}
                       onTouchStart={(e) => handleCellDown(r, c, e)}
