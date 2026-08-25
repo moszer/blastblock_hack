@@ -107,7 +107,13 @@ export default function GridPathSolver() {
   const dragMode = useRef<'add' | 'remove' | null>(null);
   const dragSeen = useRef<Set<PointStr>>(new Set());
   const lastTouchTime = useRef<number>(0);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  
+  // Camera state
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animationRef = useRef<number | null>(null);
+  const liveCellsRef = useRef<Set<PointStr>>(new Set());
 
   // Resize effect for responsiveness
   useEffect(() => {
@@ -274,59 +280,114 @@ export default function GridPathSolver() {
     setSolution(null);
   };
 
-  const handleImageScan = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const startCamera = async () => {
+    setIsCameraActive(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' }
+      });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play();
+      }
+      processVideo();
+    } catch (err) {
+      alert("Could not access camera: " + err);
+      setIsCameraActive(false);
+    }
+  };
 
-    setStatus("Scanning image...");
-    const img = new Image();
-    const url = URL.createObjectURL(file);
+  const stopCamera = () => {
+    if (videoRef.current?.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach(track => track.stop());
+      videoRef.current.srcObject = null;
+    }
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
+    setIsCameraActive(false);
+  };
+
+  const processVideo = () => {
+    if (!videoRef.current || !canvasRef.current) return;
     
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      
-      ctx.drawImage(img, 0, 0);
-      
-      const newCells = new Set<PointStr>();
-      // Assume grid is centered and takes up ~90% of the image
-      const marginX = img.width * 0.05;
-      const marginY = img.height * 0.05;
-      const usableWidth = img.width - marginX * 2;
-      const usableHeight = img.height - marginY * 2;
-      const cellW = usableWidth / cols;
-      const cellH = usableHeight / rows;
+      if (ctx) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        
+        const newCells = new Set<PointStr>();
+        // Assume grid takes ~90% of frame
+        const marginX = canvas.width * 0.05;
+        const marginY = canvas.height * 0.05;
+        const usableWidth = canvas.width - marginX * 2;
+        const usableHeight = canvas.height - marginY * 2;
+        const cellW = usableWidth / cols;
+        const cellH = usableHeight / rows;
 
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          const px = Math.floor(marginX + c * cellW + cellW / 2);
-          const py = Math.floor(marginY + r * cellH + cellH / 2);
-          
-          const pixel = ctx.getImageData(px, py, 1, 1).data;
-          // Calculate brightness (average of RGB)
-          const brightness = (pixel[0] + pixel[1] + pixel[2]) / 3;
-          
-          // Blocks are usually bright on a dark background. Adjust threshold if needed.
-          if (brightness > 60) {
-            newCells.add(toStr({ r, c }));
+        // Draw grid overlay
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+        ctx.lineWidth = 1;
+        
+        for(let r = 0; r <= rows; r++) {
+          ctx.beginPath();
+          ctx.moveTo(marginX, marginY + r * cellH);
+          ctx.lineTo(marginX + usableWidth, marginY + r * cellH);
+          ctx.stroke();
+        }
+        for(let c = 0; c <= cols; c++) {
+          ctx.beginPath();
+          ctx.moveTo(marginX + c * cellW, marginY);
+          ctx.lineTo(marginX + c * cellW, marginY + usableHeight);
+          ctx.stroke();
+        }
+
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imageData.data;
+        
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            const px = Math.floor(marginX + c * cellW + cellW / 2);
+            const py = Math.floor(marginY + r * cellH + cellH / 2);
+            
+            const idx = (py * canvas.width + px) * 4;
+            const brightness = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+            
+            if (brightness > 60) {
+              newCells.add(toStr({ r, c }));
+              // Draw highlight for detected cell
+              ctx.fillStyle = 'rgba(61, 139, 253, 0.5)';
+              ctx.fillRect(marginX + c * cellW + 2, marginY + r * cellH + 2, cellW - 4, cellH - 4);
+            }
+            
+            // Draw center sampling dot
+            ctx.fillStyle = '#ff4d4f';
+            ctx.beginPath();
+            ctx.arc(px, py, 2, 0, Math.PI * 2);
+            ctx.fill();
           }
         }
+        liveCellsRef.current = newCells;
       }
-      
-      setActiveCells(newCells);
-      setStart(null);
-      setEnd(null);
-      setSolution(null);
-      setStatus(`Scanned! Found ${newCells.size} blocks.`);
-      playSound('solve'); // Play a nice sound on finish
-      URL.revokeObjectURL(url);
-    };
-    
-    img.src = url;
-    e.target.value = ''; // Reset input
+    }
+    animationRef.current = requestAnimationFrame(processVideo);
+  };
+
+  const confirmScan = () => {
+    setActiveCells(new Set(liveCellsRef.current));
+    setStart(null);
+    setEnd(null);
+    setSolution(null);
+    setStatus(`Scanned! Found ${liveCellsRef.current.size} blocks.`);
+    playSound('solve');
+    stopCamera();
   };
 
   const solve = () => {
@@ -395,9 +456,8 @@ export default function GridPathSolver() {
             <button className={`btn join-item ${toolMode === 'paint' ? 'btn-neutral' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('paint')}>✏️ Paint</button>
             <button className={`btn join-item ${toolMode === 'start' ? 'btn-info text-info-content' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('start')}>🔵 Start</button>
             <button className={`btn join-item ${toolMode === 'end' ? 'btn-warning text-warning-content' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('end')}>🟧 End</button>
-            <button className="btn join-item btn-ghost border border-base-300 text-secondary font-semibold" onClick={() => fileInputRef.current?.click()}>📷 Scan</button>
+            <button className="btn join-item btn-ghost border border-base-300 text-secondary font-semibold" onClick={startCamera}>📷 Scan</button>
           </div>
-          <input type="file" accept="image/*" capture="environment" ref={fileInputRef} onChange={handleImageScan} className="hidden" />
         </div>
 
         {/* Control Panel */}
@@ -508,6 +568,30 @@ export default function GridPathSolver() {
           </div>
         </div>
         
+        {/* Live Camera Overlay */}
+        {isCameraActive && (
+          <div className="fixed inset-0 z-50 bg-black flex flex-col">
+            <div className="relative flex-1 bg-black overflow-hidden flex items-center justify-center">
+              <video 
+                ref={videoRef} 
+                className="absolute inset-0 w-full h-full object-contain opacity-0 pointer-events-none" 
+                playsInline 
+                autoPlay 
+                muted
+              />
+              <canvas 
+                ref={canvasRef} 
+                className="absolute inset-0 w-full h-full object-contain"
+              />
+            </div>
+            
+            <div className="bg-base-300 p-6 flex justify-between items-center z-10 border-t border-base-100" style={{ paddingBottom: 'max(1.5rem, env(safe-area-inset-bottom))' }}>
+              <button className="btn btn-ghost text-error text-lg" onClick={stopCamera}>Cancel</button>
+              <p className="text-sm font-semibold opacity-80 max-w-[150px] text-center leading-tight">Line up grid with game</p>
+              <button className="btn btn-primary btn-lg shadow-lg shadow-primary/30" onClick={confirmScan}>Capture</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
