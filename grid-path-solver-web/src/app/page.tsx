@@ -43,6 +43,7 @@ export default function GridPathSolver() {
   // Drag state
   const dragMode = useRef<'add' | 'remove' | null>(null);
   const dragSeen = useRef<Set<PointStr>>(new Set());
+  const lastTouchTime = useRef<number>(0);
 
   // Resize effect for responsiveness
   useEffect(() => {
@@ -62,6 +63,14 @@ export default function GridPathSolver() {
 
   // Handlers
   const handleCellDown = (r: number, c: number, e?: React.MouseEvent | React.TouchEvent) => {
+    if (e && e.type === 'touchstart') {
+      lastTouchTime.current = Date.now();
+    } else if (e && e.type === 'mousedown') {
+      if (Date.now() - lastTouchTime.current < 500) {
+        return; // Ignore synthetic mousedown
+      }
+    }
+
     if (e && e.cancelable) e.preventDefault(); 
     const pStr = toStr({ r, c });
     
