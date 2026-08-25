@@ -29,6 +29,69 @@ const CELL_SIZE = 48; // w-12 = 3rem = 48px
 const GAP = 6;
 const PAD = 32; // p-8 = 2rem = 32px
 
+// Global AudioContext for sound effects
+let audioCtx: AudioContext | null = null;
+const playSound = (type: 'add' | 'remove' | 'start' | 'end' | 'solve' | 'error') => {
+  try {
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContextClass) return;
+    
+    if (!audioCtx) audioCtx = new AudioContextClass();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+
+    const osc = audioCtx.createOscillator();
+    const gainNode = audioCtx.createGain();
+    
+    osc.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
+    
+    const t = audioCtx.currentTime;
+    if (type === 'add') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(400, t);
+      osc.frequency.exponentialRampToValueAtTime(600, t + 0.05);
+      gainNode.gain.setValueAtTime(0.1, t);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+      osc.start();
+      osc.stop(t + 0.05);
+    } else if (type === 'remove') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(300, t);
+      osc.frequency.exponentialRampToValueAtTime(150, t + 0.05);
+      gainNode.gain.setValueAtTime(0.1, t);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+      osc.start();
+      osc.stop(t + 0.05);
+    } else if (type === 'start' || type === 'end') {
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(type === 'start' ? 880 : 660, t);
+      gainNode.gain.setValueAtTime(0.1, t);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+      osc.start();
+      osc.stop(t + 0.1);
+    } else if (type === 'solve') {
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(440, t);
+      osc.frequency.setValueAtTime(554, t + 0.1);
+      osc.frequency.setValueAtTime(659, t + 0.2);
+      gainNode.gain.setValueAtTime(0.05, t);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+      osc.start();
+      osc.stop(t + 0.4);
+    } else if (type === 'error') {
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(200, t);
+      osc.frequency.exponentialRampToValueAtTime(100, t + 0.3);
+      gainNode.gain.setValueAtTime(0.1, t);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+      osc.start();
+      osc.stop(t + 0.3);
+    }
+  } catch (e) {
+    console.error("Audio playback failed", e);
+  }
+};
+
 export default function GridPathSolver() {
   const [rows, setRows] = useState(9);
   const [cols, setCols] = useState(8);
@@ -78,6 +141,7 @@ export default function GridPathSolver() {
       if (activeCells.has(pStr)) {
         setStart(pStr);
         setSolution(null);
+        playSound('start');
       }
       if (toolMode === 'start') setToolMode('paint');
       return;
@@ -87,6 +151,7 @@ export default function GridPathSolver() {
       if (activeCells.has(pStr)) {
         setEnd(prev => prev === pStr ? null : pStr);
         setSolution(null);
+        playSound('end');
       }
       if (toolMode === 'end') setToolMode('paint');
       return;
@@ -141,6 +206,11 @@ export default function GridPathSolver() {
 
   const paintCell = (pStr: PointStr, mode: 'add' | 'remove') => {
     setActiveCells(prev => {
+      const isChanging = mode === 'add' ? !prev.has(pStr) : prev.has(pStr);
+      if (isChanging) {
+        playSound(mode);
+      }
+
       const next = new Set(prev);
       if (mode === 'add') {
         next.add(pStr);
@@ -225,10 +295,14 @@ export default function GridPathSolver() {
         const solStrs = res.map(toStr);
         setSolution(solStrs);
         setStatus(`Found solution! Length: ${res.length}`);
+        playSound('solve');
       } else {
         setSolution(null);
         setStatus("No solution found.");
-        alert("No path found that visits all active cells exactly once without crossing.");
+        playSound('error');
+        setTimeout(() => {
+          alert("No path found that visits all active cells exactly once without crossing.");
+        }, 50);
       }
     }, 10);
   };
