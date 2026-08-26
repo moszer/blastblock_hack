@@ -105,6 +105,93 @@ const playSound = (type: 'add' | 'remove' | 'start' | 'end' | 'solve' | 'error')
   }
 };
 
+// The path animation walks one cell every PATH_STEP_SECONDS (see the
+// animationDelay on each cell), and the notes below are scheduled on the audio
+// clock to land on the same beat.
+const PATH_STEP_SECONDS = 0.05;
+
+// Pentatonic degrees, so a long path never turns into a dissonant run
+const PENTATONIC_RATIOS = [1, 9 / 8, 5 / 4, 3 / 2, 5 / 3];
+const PATH_BASE_FREQ = 261.63; // C4
+const PATH_MAX_NOTES = 200;
+
+let scheduledPathNodes: OscillatorNode[] = [];
+
+/**
+ * Browsers only let an AudioContext start from a user gesture, so this runs
+ * straight from the click rather than from the work that follows it.
+ */
+const ensureAudioContext = () => {
+  try {
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContextClass) return;
+    if (!audioCtx) audioCtx = new AudioContextClass();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch {
+    // no audio available
+  }
+};
+
+const stopPathSequence = () => {
+  for (const osc of scheduledPathNodes) {
+    try {
+      osc.stop();
+    } catch {
+      // already finished
+    }
+  }
+  scheduledPathNodes = [];
+};
+
+/** Blip once per cell as the solution animates across the grid */
+const playPathSequence = (steps: number) => {
+  try {
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContextClass || steps <= 0) return;
+
+    if (!audioCtx) audioCtx = new AudioContextClass();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+
+    stopPathSequence();
+
+    const ctx = audioCtx;
+    const start = ctx.currentTime + 0.03;
+    const noteCount = Math.min(steps, PATH_MAX_NOTES);
+
+    const blip = (at: number, freq: number, peak: number, length: number, type: OscillatorType) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, at);
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(peak, at + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + length);
+      osc.start(at);
+      osc.stop(at + length + 0.02);
+      scheduledPathNodes.push(osc);
+    };
+
+    for (let i = 0; i < noteCount; i++) {
+      // Climb the scale, dropping back an octave every 3 so the run keeps
+      // rising without running out of hearing range
+      const degree = i % PENTATONIC_RATIOS.length;
+      const octave = Math.floor(i / PENTATONIC_RATIOS.length) % 3;
+      const freq = PATH_BASE_FREQ * PENTATONIC_RATIOS[degree] * Math.pow(2, octave);
+      blip(start + i * PATH_STEP_SECONDS, freq, 0.05, 0.11, 'triangle');
+    }
+
+    // Chord when the last cell lands
+    const finish = start + noteCount * PATH_STEP_SECONDS;
+    blip(finish, PATH_BASE_FREQ * 2, 0.07, 0.5, 'sine');
+    blip(finish + 0.06, PATH_BASE_FREQ * 2 * (5 / 4), 0.06, 0.5, 'sine');
+    blip(finish + 0.12, PATH_BASE_FREQ * 3, 0.06, 0.6, 'sine');
+  } catch (e) {
+    console.error("Audio playback failed", e);
+  }
+};
+
 export default function GridPathSolver() {
   const [rows, setRows] = useState(9);
   const [cols, setCols] = useState(8);
@@ -188,6 +275,17 @@ export default function GridPathSolver() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationRef = useRef<number | null>(null);
   const liveCellsRef = useRef<Set<PointStr>>(new Set());
+
+  // The blips are scheduled from here rather than from solve() so they start
+  // on the same render that starts the CSS animation.
+  useEffect(() => {
+    if (solution && solution.length > 0) {
+      playPathSequence(solution.length);
+    } else {
+      stopPathSequence();
+    }
+    return stopPathSequence;
+  }, [solution]);
 
   // Load OpenCV.js asynchronously on mount
   useEffect(() => {
@@ -1294,6 +1392,7 @@ export default function GridPathSolver() {
   };
 
   const solve = () => {
+    ensureAudioContext();
     if (activeCells.size === 0) {
       alert("No active cells.");
       return;
@@ -1315,7 +1414,6 @@ export default function GridPathSolver() {
         const solStrs = res.map(toStr);
         setSolution(solStrs);
         setStatus(`Found solution! Length: ${res.length}`);
-        playSound('solve');
       } else {
         setSolution(null);
         setStatus("No solution found.");
@@ -1437,7 +1535,7 @@ export default function GridPathSolver() {
                     cellClass += "bg-base-100/10 border border-base-content/5 border-dashed";
                   } else if (isPath) {
                     cellClass += "bg-[#7db8f5] text-slate-900 animate-path shadow-lg shadow-[#7db8f5]/40";
-                    cellStyle = { animationDelay: `${pathIndex * 0.05}s`, animationFillMode: 'both' };
+                    cellStyle = { animationDelay: `${pathIndex * PATH_STEP_SECONDS}s`, animationFillMode: 'both' };
                   } else {
                     cellClass += "bg-[#5f6068] text-white hover:bg-neutral-focus animate-pop shadow-md";
                   }
