@@ -527,7 +527,7 @@ const imageToLattice = (
  */
 export const detectBlockGrid = (
   canvas: HTMLCanvasElement,
-  options: { sensitivity?: number; maxDim?: number } = {}
+  options: { sensitivity?: number; maxDim?: number; outputScale?: number } = {}
 ): BlockGridDetection | null => {
   const cv = (window as any).cv;
   if (!cv || !cv.Mat) return null;
@@ -535,6 +535,9 @@ export const detectBlockGrid = (
 
   const sensitivity = options.sensitivity ?? 0;
   const maxDim = options.maxDim ?? 640;
+  // Callers that hand us an already-shrunk frame use this to map the result
+  // back onto the full-size canvas.
+  const outputScale = options.outputScale ?? 1;
 
   let src: any = null;
   let small: any = null;
@@ -568,7 +571,7 @@ export const detectBlockGrid = (
     kernel = cv.Mat.ones(3, 3, cv.CV_8U);
 
     const totalArea = sw * sh;
-    const upscale = 1 / scale;
+    const upscale = outputScale / scale;
 
     // The blocks may be lighter than the background (dark theme) or darker
     // (light theme), and glare can defeat a global threshold entirely — so try
@@ -653,6 +656,11 @@ export const detectBlockGrid = (
       // Occupancy pass: sample the mask at every lattice cell. This recovers
       // cells whose blobs merged together or were rejected as non-square.
       const sampleRadius = Math.max(1, Math.round(Math.min(Math.hypot(ex.x, ex.y), Math.hypot(ey.x, ey.y)) * 0.28));
+      // Reading through Mat.ucharPtr costs a call per pixel and dominates the
+      // whole detection; the backing buffers are plain typed arrays.
+      const binData: Uint8Array = bin.data;
+      const rgbaData: Uint8Array = small.data;
+      const sampleStep = Math.max(1, Math.round(sampleRadius / 6));
       const cells: string[] = [];
       const blocks: DetectedBlock[] = [];
       let bestSpecial: DetectedBlock | null = null;
@@ -669,18 +677,20 @@ export const detectBlockGrid = (
           let sumG = 0;
           let sumB = 0;
 
-          for (let dy = -sampleRadius; dy <= sampleRadius; dy++) {
+          for (let dy = -sampleRadius; dy <= sampleRadius; dy += sampleStep) {
             const y = py + dy;
             if (y < 0 || y >= sh) continue;
-            for (let dx = -sampleRadius; dx <= sampleRadius; dx++) {
+            const rowStart = y * sw;
+            for (let dx = -sampleRadius; dx <= sampleRadius; dx += sampleStep) {
               const x = px + dx;
               if (x < 0 || x >= sw) continue;
               total++;
-              if (bin.ucharPtr(y, x)[0] > 127) on++;
-              const rgba = small.ucharPtr(y, x);
-              sumR += rgba[0];
-              sumG += rgba[1];
-              sumB += rgba[2];
+              const idx = rowStart + x;
+              if (binData[idx] > 127) on++;
+              const rgba = idx * 4;
+              sumR += rgbaData[rgba];
+              sumG += rgbaData[rgba + 1];
+              sumB += rgbaData[rgba + 2];
             }
           }
 

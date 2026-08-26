@@ -157,6 +157,12 @@ export default function GridPathSolver() {
   const pendingGridRef = useRef<{ rows: number; cols: number; start: PointStr | null } | null>(null);
 
   const BLOCK_LOCK_FRAMES = 6;
+  // The preview is displayed a few hundred CSS pixels wide, so a full 1080p
+  // frame buys nothing and makes every draw and pixel read more expensive.
+  const PREVIEW_MAX_DIM = 1280;
+  const DETECT_MAX_DIM = 480;
+  const detectCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastQuadScanRef = useRef<number>(0);
 
   // Frame rotation: some browsers hand back a landscape track even when the
   // device is upright, so the frame is rotated on the way into the canvas.
@@ -798,7 +804,22 @@ export default function GridPathSolver() {
     // the latest result so the preview stays smooth.
     if (now - lastBlockScanRef.current > 90) {
       lastBlockScanRef.current = now;
-      const det = detectBlockGrid(canvas, { sensitivity: scanParamsRef.current.sensitivity });
+
+      // Detect on a small copy of the frame: every OpenCV stage scales with
+      // the pixel count, and the lattice is just as findable at this size.
+      if (!detectCanvasRef.current) detectCanvasRef.current = document.createElement('canvas');
+      const detectCanvas = detectCanvasRef.current;
+      const shrink = Math.min(1, DETECT_MAX_DIM / Math.max(canvas.width, canvas.height));
+      detectCanvas.width = Math.max(1, Math.round(canvas.width * shrink));
+      detectCanvas.height = Math.max(1, Math.round(canvas.height * shrink));
+      const detectCtx = detectCanvas.getContext('2d', { willReadFrequently: true });
+      if (!detectCtx) return 'none';
+      detectCtx.drawImage(canvas, 0, 0, detectCanvas.width, detectCanvas.height);
+
+      const det = detectBlockGrid(detectCanvas, {
+        sensitivity: scanParamsRef.current.sensitivity,
+        outputScale: canvas.width / detectCanvas.width,
+      });
 
       if (det) {
         const sig = detectionSignature(det);
@@ -874,11 +895,19 @@ export default function GridPathSolver() {
 
       const rotation = frameRotationRef.current;
       const quarterTurn = rotation === 90 || rotation === 270;
-      canvas.width = quarterTurn ? vh : vw;
-      canvas.height = quarterTurn ? vw : vh;
+      const uprightW = quarterTurn ? vh : vw;
+      const uprightH = quarterTurn ? vw : vh;
+      const fit = Math.min(1, PREVIEW_MAX_DIM / Math.max(uprightW, uprightH));
+      canvas.width = Math.max(1, Math.round(uprightW * fit));
+      canvas.height = Math.max(1, Math.round(uprightH * fit));
 
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (ctx) {
+        // After a quarter turn the drawing axes are swapped, so the frame is
+        // stretched across (height, width) instead.
+        const drawW = quarterTurn ? canvas.height : canvas.width;
+        const drawH = quarterTurn ? canvas.width : canvas.height;
+
         ctx.save();
         if (rotation === 90) {
           ctx.translate(canvas.width, 0);
@@ -890,7 +919,7 @@ export default function GridPathSolver() {
           ctx.translate(0, canvas.height);
           ctx.rotate(-Math.PI / 2);
         }
-        ctx.drawImage(video, 0, 0, vw, vh);
+        ctx.drawImage(video, 0, 0, drawW, drawH);
         ctx.restore();
 
         const now = Date.now();
@@ -907,15 +936,23 @@ export default function GridPathSolver() {
           // --- FALLBACK: whole-board quad detection ---
           const expectedRatio = cols / rows;
           let detected: QuadCorners | null = null;
+          // Contour searching is far too heavy to redo on every frame; the
+          // last quad keeps being tracked in between.
+          const scanForQuad = now - lastQuadScanRef.current > 120;
 
-          if ((window as any).cv && (window as any).cv.Mat) {
-            detected = detectQuadOpenCV(canvas, expectedRatio);
-          }
-          if (!detected) {
-            detected = detectQuadFast(ctx, canvas.width, canvas.height, expectedRatio);
+          if (scanForQuad) {
+            lastQuadScanRef.current = now;
+            if ((window as any).cv && (window as any).cv.Mat) {
+              detected = detectQuadOpenCV(canvas, expectedRatio);
+            }
+            if (!detected) {
+              detected = detectQuadFast(ctx, canvas.width, canvas.height, expectedRatio);
+            }
           }
 
-          if (detected) {
+          if (!scanForQuad) {
+            // keep the previous quad and its stability score untouched
+          } else if (detected) {
             const smoothed = smoothQuad(lastDetectedQuadRef.current, detected, 0.35);
             if (lastDetectedQuadRef.current && smoothed) {
               const movement = getQuadMovement(lastDetectedQuadRef.current, smoothed);
