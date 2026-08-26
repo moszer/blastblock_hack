@@ -157,6 +157,14 @@ export default function GridPathSolver() {
   const pendingGridRef = useRef<{ rows: number; cols: number; start: PointStr | null } | null>(null);
 
   const BLOCK_LOCK_FRAMES = 6;
+
+  // Frame rotation: some browsers hand back a landscape track even when the
+  // device is upright, so the frame is rotated on the way into the canvas.
+  const [frameRotation, setFrameRotation] = useState(0);
+  const frameRotationRef = useRef(0);
+  frameRotationRef.current = frameRotation;
+  const uiPortraitRef = useRef(true);
+  const autoRotationDoneRef = useRef(false);
   const autoCapturedRef = useRef<boolean>(false);
   const searchRadarAngleRef = useRef<number>(0);
 
@@ -497,6 +505,7 @@ export default function GridPathSolver() {
     lastDetectedQuadRef.current = null;
     stabilityFramesRef.current = 0;
     liveCellsRef.current = new Set();
+    autoRotationDoneRef.current = false;
     setDetectedGrid(null);
     setLiveDetectedCount(0);
     setLockProgress(0);
@@ -517,6 +526,7 @@ export default function GridPathSolver() {
       // landscape frame on a phone held upright letterboxes the preview into a
       // thin strip and wastes most of the screen.
       const portrait = window.innerHeight >= window.innerWidth;
+      uiPortraitRef.current = portrait;
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
@@ -849,11 +859,40 @@ export default function GridPathSolver() {
     const canvas = canvasRef.current;
     
     if (video.readyState === video.HAVE_ENOUGH_DATA) {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+
+      // A landscape track on an upright device gets turned a quarter turn so
+      // the preview fills the screen the way the user is holding it.
+      if (!autoRotationDoneRef.current && vw > 0 && vh > 0) {
+        autoRotationDoneRef.current = true;
+        if (uiPortraitRef.current && vw > vh) {
+          setFrameRotation(90);
+          frameRotationRef.current = 90;
+        }
+      }
+
+      const rotation = frameRotationRef.current;
+      const quarterTurn = rotation === 90 || rotation === 270;
+      canvas.width = quarterTurn ? vh : vw;
+      canvas.height = quarterTurn ? vw : vh;
+
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (ctx) {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        ctx.save();
+        if (rotation === 90) {
+          ctx.translate(canvas.width, 0);
+          ctx.rotate(Math.PI / 2);
+        } else if (rotation === 180) {
+          ctx.translate(canvas.width, canvas.height);
+          ctx.rotate(Math.PI);
+        } else if (rotation === 270) {
+          ctx.translate(0, canvas.height);
+          ctx.rotate(-Math.PI / 2);
+        }
+        ctx.drawImage(video, 0, 0, vw, vh);
+        ctx.restore();
+
         const now = Date.now();
 
         if (scanModeRef.current === 'auto') {
@@ -1463,6 +1502,18 @@ export default function GridPathSolver() {
                     ⚙️
                   </button>
                 )}
+                <button 
+                  className="btn btn-sm btn-circle btn-neutral text-white border border-white/20 shadow"
+                  onClick={() => {
+                    setFrameRotation(prev => (prev + 90) % 360);
+                    resetDetectorState();
+                    autoRotationDoneRef.current = true;
+                    autoCapturedRef.current = false;
+                  }}
+                  title="หมุนภาพ (Rotate frame)"
+                >
+                  ⟳
+                </button>
                 <button 
                   className="btn btn-sm btn-circle btn-neutral text-white border border-white/20 shadow"
                   onClick={toggleCamera}
