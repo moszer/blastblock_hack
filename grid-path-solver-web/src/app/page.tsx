@@ -513,17 +513,39 @@ export default function GridPathSolver() {
         stream.getTracks().forEach(track => track.stop());
       }
 
+      // Match the stream to how the device is being held: asking for a
+      // landscape frame on a phone held upright letterboxes the preview into a
+      // thin strip and wastes most of the screen.
+      const portrait = window.innerHeight >= window.innerWidth;
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { 
+        video: {
           facingMode: targetFacing,
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
+          width: { ideal: portrait ? 1080 : 1920 },
+          height: { ideal: portrait ? 1920 : 1080 },
+          aspectRatio: { ideal: portrait ? 9 / 16 : 16 / 9 },
         }
       });
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         videoRef.current.play();
       }
+
+      // Some browsers ignore the ideal size and hand back a landscape track
+      // anyway; ask the track itself to switch once it is running.
+      if (portrait) {
+        const [track] = stream.getVideoTracks();
+        const settings = track?.getSettings?.();
+        if (track && settings && (settings.width ?? 0) > (settings.height ?? 0)) {
+          try {
+            await track.applyConstraints({ aspectRatio: { ideal: 9 / 16 } });
+          } catch {
+            // Camera cannot deliver a portrait frame; the preview still works
+          }
+        }
+      }
+
       processVideo();
     } catch (err) {
       alert("Could not access camera: " + err);
