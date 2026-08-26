@@ -2,6 +2,15 @@
 
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { Point, PointStr, toStr, fromStr, solveHamiltonianPath } from '@/utils/solver';
+import { 
+  loadOpenCV, 
+  detectQuadOpenCV, 
+  detectQuadFast, 
+  smoothQuad, 
+  getQuadMovement, 
+  mapGridToImage, 
+  QuadCorners 
+} from '@/utils/cvScanner';
 
 // Default layout from original Python code
 const defaultLayout: Record<number, number[]> = {
@@ -111,6 +120,12 @@ export default function GridPathSolver() {
   // Camera state & real-time grid adjustments
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
+  const [autoSnap, setAutoSnap] = useState(true);
+  const [cvReady, setCvReady] = useState(false);
+  const [detectionStatus, setDetectionStatus] = useState<'searching' | 'tracking' | 'locked'>('searching');
+  const [lockProgress, setLockProgress] = useState(0);
+
   const [scanScale, setScanScale] = useState(1.0);
   const [scanWidthScale, setScanWidthScale] = useState(1.0);
   const [scanHeightScale, setScanHeightScale] = useState(1.0);
@@ -119,6 +134,16 @@ export default function GridPathSolver() {
   const [scanSensitivity, setScanSensitivity] = useState(0);
   const [liveDetectedCount, setLiveDetectedCount] = useState(0);
   const [showAdvancedScan, setShowAdvancedScan] = useState(false);
+
+  const scanModeRef = useRef<'auto' | 'manual'>('auto');
+  scanModeRef.current = scanMode;
+  const autoSnapRef = useRef(true);
+  autoSnapRef.current = autoSnap;
+
+  const lastDetectedQuadRef = useRef<QuadCorners | null>(null);
+  const stabilityFramesRef = useRef<number>(0);
+  const autoCapturedRef = useRef<boolean>(false);
+  const searchRadarAngleRef = useRef<number>(0);
 
   const scanParamsRef = useRef({
     scale: 1.0,
@@ -134,6 +159,13 @@ export default function GridPathSolver() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationRef = useRef<number | null>(null);
   const liveCellsRef = useRef<Set<PointStr>>(new Set());
+
+  // Load OpenCV.js asynchronously on mount
+  useEffect(() => {
+    loadOpenCV().then(ready => {
+      if (ready) setCvReady(true);
+    });
+  }, []);
 
   // Gestures ref
   const touchStateRef = useRef<{
@@ -588,162 +620,332 @@ export default function GridPathSolver() {
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (ctx) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        
-        // Calculate a centered box for the grid based on its true aspect ratio
-        const padding = 24;
-        const availableW = canvas.width - padding * 2;
-        const availableH = canvas.height - padding * 2;
-        const gridRatio = cols / rows;
-        
-        let baseBoxW = availableW;
-        let baseBoxH = baseBoxW / gridRatio;
-        
-        if (baseBoxH > availableH) {
-          baseBoxH = availableH;
-          baseBoxW = baseBoxH * gridRatio;
-        }
+        const now = Date.now();
 
-        // Apply real-time calibrated scale, aspect ratio and position offset
-        const { scale: sScale, widthScale: wScale, heightScale: hScale, offsetX: offX, offsetY: offY, sensitivity } = scanParamsRef.current;
-        
-        const boxW = baseBoxW * sScale * wScale;
-        const boxH = baseBoxH * sScale * hScale;
-        
-        const startX = (canvas.width - boxW) / 2 + (offX * canvas.width);
-        const startY = (canvas.height - boxH) / 2 + (offY * canvas.height);
-        const cellW = boxW / cols;
-        const cellH = boxH / rows;
+        if (scanModeRef.current === 'auto') {
+          // --- AUTO-DETECTION (OpenCV / Computer Vision) ---
+          const expectedRatio = cols / rows;
+          let detected: QuadCorners | null = null;
 
-        // Draw modern outer grid frame with corner brackets
-        ctx.save();
-        ctx.strokeStyle = '#38bdf8';
-        ctx.lineWidth = Math.max(3, Math.min(6, Math.floor(canvas.width / 250)));
-        ctx.lineCap = 'round';
-        const bracketLen = Math.min(cellW, cellH, 30);
-
-        // Top-Left
-        ctx.beginPath();
-        ctx.moveTo(startX, startY + bracketLen);
-        ctx.lineTo(startX, startY);
-        ctx.lineTo(startX + bracketLen, startY);
-        ctx.stroke();
-
-        // Top-Right
-        ctx.beginPath();
-        ctx.moveTo(startX + boxW - bracketLen, startY);
-        ctx.lineTo(startX + boxW, startY);
-        ctx.lineTo(startX + boxW, startY + bracketLen);
-        ctx.stroke();
-
-        // Bottom-Left
-        ctx.beginPath();
-        ctx.moveTo(startX, startY + boxH - bracketLen);
-        ctx.lineTo(startX, startY + boxH);
-        ctx.lineTo(startX + bracketLen, startY + boxH);
-        ctx.stroke();
-
-        // Bottom-Right
-        ctx.beginPath();
-        ctx.moveTo(startX + boxW - bracketLen, startY + boxH);
-        ctx.lineTo(startX + boxW, startY + boxH);
-        ctx.lineTo(startX + boxW, startY + boxH - bracketLen);
-        ctx.stroke();
-        ctx.restore();
-
-        // Draw subtle center guide reticle
-        const cx = startX + boxW / 2;
-        const cy = startY + boxH / 2;
-        ctx.save();
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.4)';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(cx - 10, cy);
-        ctx.lineTo(cx + 10, cy);
-        ctx.moveTo(cx, cy - 10);
-        ctx.lineTo(cx, cy + 10);
-        ctx.stroke();
-        ctx.restore();
-
-        // Draw grid overlay lines
-        ctx.save();
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
-        ctx.lineWidth = Math.max(1, Math.min(2, Math.floor(canvas.width / 500)));
-        
-        for (let r = 0; r <= rows; r++) {
-          ctx.beginPath();
-          ctx.moveTo(startX, startY + r * cellH);
-          ctx.lineTo(startX + boxW, startY + r * cellH);
-          ctx.stroke();
-        }
-        for (let c = 0; c <= cols; c++) {
-          ctx.beginPath();
-          ctx.moveTo(startX + c * cellW, startY);
-          ctx.lineTo(startX + c * cellW, startY + boxH);
-          ctx.stroke();
-        }
-        ctx.restore();
-
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const data = imageData.data;
-        
-        // Collect samples to find the adaptive threshold
-        const samples: {r: number, c: number, b: number, px: number, py: number}[] = [];
-        
-        for (let r = 0; r < rows; r++) {
-          for (let c = 0; c < cols; c++) {
-            const px = Math.floor(startX + c * cellW + cellW / 2);
-            const py = Math.floor(startY + r * cellH + cellH / 2);
-            
-            if (px >= 0 && px < canvas.width && py >= 0 && py < canvas.height) {
-              const idx = (py * canvas.width + px) * 4;
-              const brightness = (data[idx] + data[idx+1] + data[idx+2]) / 3;
-              samples.push({ r, c, b: brightness, px, py });
-            }
+          if ((window as any).cv && (window as any).cv.Mat) {
+            detected = detectQuadOpenCV(canvas, expectedRatio);
           }
-        }
-        
-        // Adaptive Thresholding: sort by brightness and find the biggest gap
-        const sorted = [...samples].sort((a, b) => a.b - b.b);
-        let maxGap = 0;
-        let baseThreshold = 60; // fallback
-        
-        if (sorted.length > 0) {
-          for (let i = 0; i < sorted.length - 1; i++) {
-            const gap = sorted[i+1].b - sorted[i].b;
-            if (gap > maxGap && i > sorted.length * 0.1 && i < sorted.length * 0.9) {
-              maxGap = gap;
-              baseThreshold = sorted[i].b + gap / 2;
-            }
+          if (!detected) {
+            detected = detectQuadFast(ctx, canvas.width, canvas.height, expectedRatio);
           }
-        }
 
-        // Apply user sensitivity offset
-        const threshold = Math.max(10, Math.min(245, baseThreshold + sensitivity));
-        const newCells = new Set<PointStr>();
-        
-        for (const s of samples) {
-          const isBlock = s.b > threshold;
-          if (isBlock) {
-            newCells.add(toStr({ r: s.r, c: s.c }));
-            // Draw vibrant block highlight
-            ctx.fillStyle = 'rgba(56, 189, 248, 0.45)';
-            ctx.fillRect(startX + s.c * cellW + 2, startY + s.r * cellH + 2, cellW - 4, cellH - 4);
+          if (detected) {
+            const smoothed = smoothQuad(lastDetectedQuadRef.current, detected, 0.35);
+            if (lastDetectedQuadRef.current && smoothed) {
+              const movement = getQuadMovement(lastDetectedQuadRef.current, smoothed);
+              if (movement < 8) {
+                stabilityFramesRef.current = Math.min(25, stabilityFramesRef.current + 1);
+              } else {
+                stabilityFramesRef.current = Math.max(0, stabilityFramesRef.current - 2);
+              }
+            } else {
+              stabilityFramesRef.current = 1;
+            }
+            lastDetectedQuadRef.current = smoothed;
+          } else {
+            stabilityFramesRef.current = Math.max(0, stabilityFramesRef.current - 1);
+          }
+
+          const quad = lastDetectedQuadRef.current;
+          const stability = stabilityFramesRef.current;
+          const isLocked = stability >= 16;
+          const isTracking = !!quad && stability > 0;
+          const progress = Math.min(100, Math.round((stability / 16) * 100));
+
+          if (now - lastCountUpdateRef.current > 120) {
+            lastCountUpdateRef.current = now;
+            setLockProgress(progress);
+            setDetectionStatus(isLocked ? 'locked' : isTracking ? 'tracking' : 'searching');
+          }
+
+          if (quad && isTracking) {
+            // Draw Tracking Bounding Quadrilateral
+            const strokeColor = isLocked ? '#22c55e' : '#38bdf8';
+            ctx.save();
+            ctx.strokeStyle = strokeColor;
+            ctx.lineWidth = isLocked ? 4 : 2.5;
+            ctx.shadowColor = strokeColor;
+            ctx.shadowBlur = isLocked ? 16 : 8;
+
+            ctx.beginPath();
+            ctx.moveTo(quad.topLeft.x, quad.topLeft.y);
+            ctx.lineTo(quad.topRight.x, quad.topRight.y);
+            ctx.lineTo(quad.bottomRight.x, quad.bottomRight.y);
+            ctx.lineTo(quad.bottomLeft.x, quad.bottomLeft.y);
+            ctx.closePath();
+            ctx.stroke();
+
+            // Draw Corner Reticles
+            const corners = [quad.topLeft, quad.topRight, quad.bottomRight, quad.bottomLeft];
+            ctx.fillStyle = strokeColor;
+            for (const pt of corners) {
+              ctx.beginPath();
+              ctx.arc(pt.x, pt.y, isLocked ? 7 : 5, 0, Math.PI * 2);
+              ctx.fill();
+            }
+
+            // Draw Perspective Grid Lines
+            ctx.strokeStyle = isLocked ? 'rgba(34, 197, 94, 0.4)' : 'rgba(255, 255, 255, 0.35)';
+            ctx.lineWidth = 1;
+            ctx.shadowBlur = 0;
+
+            for (let r = 1; r < rows; r++) {
+              const pL = mapGridToImage(0, r / rows, quad);
+              const pR = mapGridToImage(1, r / rows, quad);
+              ctx.beginPath();
+              ctx.moveTo(pL.x, pL.y);
+              ctx.lineTo(pR.x, pR.y);
+              ctx.stroke();
+            }
+            for (let c = 1; c < cols; c++) {
+              const pT = mapGridToImage(c / cols, 0, quad);
+              const pB = mapGridToImage(c / cols, 1, quad);
+              ctx.beginPath();
+              ctx.moveTo(pT.x, pT.y);
+              ctx.lineTo(pB.x, pB.y);
+              ctx.stroke();
+            }
+            ctx.restore();
+
+            // Sample Grid Cells via Bilinear Perspective Mapping
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+            const samples: {r: number, c: number, b: number, px: number, py: number}[] = [];
+
+            for (let r = 0; r < rows; r++) {
+              for (let c = 0; c < cols; c++) {
+                const centerPt = mapGridToImage((c + 0.5) / cols, (r + 0.5) / rows, quad);
+                const px = Math.floor(centerPt.x);
+                const py = Math.floor(centerPt.y);
+
+                if (px >= 0 && px < canvas.width && py >= 0 && py < canvas.height) {
+                  const idx = (py * canvas.width + px) * 4;
+                  const brightness = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+                  samples.push({ r, c, b: brightness, px, py });
+                }
+              }
+            }
+
+            const sorted = [...samples].sort((a, b) => a.b - b.b);
+            let maxGap = 0;
+            let baseThreshold = 60;
+            if (sorted.length > 0) {
+              for (let i = 0; i < sorted.length - 1; i++) {
+                const gap = sorted[i+1].b - sorted[i].b;
+                if (gap > maxGap && i > sorted.length * 0.1 && i < sorted.length * 0.9) {
+                  maxGap = gap;
+                  baseThreshold = sorted[i].b + gap / 2;
+                }
+              }
+            }
+
+            const threshold = Math.max(10, Math.min(245, baseThreshold + scanParamsRef.current.sensitivity));
+            const newCells = new Set<PointStr>();
+
+            for (const s of samples) {
+              const isBlock = s.b > threshold;
+              if (isBlock) {
+                newCells.add(toStr({ r: s.r, c: s.c }));
+                ctx.fillStyle = isLocked ? 'rgba(34, 197, 94, 0.45)' : 'rgba(56, 189, 248, 0.45)';
+                ctx.beginPath();
+                ctx.arc(s.px, s.py, 8, 0, Math.PI * 2);
+                ctx.fill();
+              }
+
+              ctx.fillStyle = isBlock ? '#22c55e' : '#f43f5e';
+              ctx.beginPath();
+              ctx.arc(s.px, s.py, 3, 0, Math.PI * 2);
+              ctx.fill();
+            }
+
+            liveCellsRef.current = newCells;
+            setLiveDetectedCount(newCells.size);
+
+            // Auto-Snap Trigger!
+            if (isLocked && autoSnapRef.current && !autoCapturedRef.current && newCells.size > 0) {
+              autoCapturedRef.current = true;
+              confirmScan();
+              return;
+            }
+          } else {
+            // Searching Animation Guide Radar
+            searchRadarAngleRef.current = (searchRadarAngleRef.current + 0.05) % (Math.PI * 2);
+            const cx = canvas.width / 2;
+            const cy = canvas.height / 2;
+            const radius = Math.min(canvas.width, canvas.height) * 0.28;
+
+            ctx.save();
+            ctx.strokeStyle = 'rgba(56, 189, 248, 0.25)';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([8, 8]);
+            ctx.beginPath();
+            ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+            ctx.stroke();
+
+            ctx.strokeStyle = 'rgba(56, 189, 248, 0.6)';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([]);
+            ctx.beginPath();
+            ctx.moveTo(cx, cy);
+            ctx.lineTo(
+              cx + Math.cos(searchRadarAngleRef.current) * radius,
+              cy + Math.sin(searchRadarAngleRef.current) * radius
+            );
+            ctx.stroke();
+            ctx.restore();
+          }
+        } else {
+          // --- MANUAL CALIBRATION MODE ---
+          const padding = 24;
+          const availableW = canvas.width - padding * 2;
+          const availableH = canvas.height - padding * 2;
+          const gridRatio = cols / rows;
+          
+          let baseBoxW = availableW;
+          let baseBoxH = baseBoxW / gridRatio;
+          
+          if (baseBoxH > availableH) {
+            baseBoxH = availableH;
+            baseBoxW = baseBoxH * gridRatio;
+          }
+
+          const { scale: sScale, widthScale: wScale, heightScale: hScale, offsetX: offX, offsetY: offY, sensitivity } = scanParamsRef.current;
+          
+          const boxW = baseBoxW * sScale * wScale;
+          const boxH = baseBoxH * sScale * hScale;
+          
+          const startX = (canvas.width - boxW) / 2 + (offX * canvas.width);
+          const startY = (canvas.height - boxH) / 2 + (offY * canvas.height);
+          const cellW = boxW / cols;
+          const cellH = boxH / rows;
+
+          // Draw modern outer grid frame with corner brackets
+          ctx.save();
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = Math.max(3, Math.min(6, Math.floor(canvas.width / 250)));
+          ctx.lineCap = 'round';
+          const bracketLen = Math.min(cellW, cellH, 30);
+
+          // Top-Left
+          ctx.beginPath();
+          ctx.moveTo(startX, startY + bracketLen);
+          ctx.lineTo(startX, startY);
+          ctx.lineTo(startX + bracketLen, startY);
+          ctx.stroke();
+
+          // Top-Right
+          ctx.beginPath();
+          ctx.moveTo(startX + boxW - bracketLen, startY);
+          ctx.lineTo(startX + boxW, startY);
+          ctx.lineTo(startX + boxW, startY + bracketLen);
+          ctx.stroke();
+
+          // Bottom-Left
+          ctx.beginPath();
+          ctx.moveTo(startX, startY + boxH - bracketLen);
+          ctx.lineTo(startX, startY + boxH);
+          ctx.lineTo(startX + bracketLen, startY + boxH);
+          ctx.stroke();
+
+          // Bottom-Right
+          ctx.beginPath();
+          ctx.moveTo(startX + boxW - bracketLen, startY + boxH);
+          ctx.lineTo(startX + boxW, startY + boxH);
+          ctx.lineTo(startX + boxW, startY + boxH - bracketLen);
+          ctx.stroke();
+          ctx.restore();
+
+          // Center Reticle
+          const cx = startX + boxW / 2;
+          const cy = startY + boxH / 2;
+          ctx.save();
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.4)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(cx - 10, cy);
+          ctx.lineTo(cx + 10, cy);
+          ctx.moveTo(cx, cy - 10);
+          ctx.lineTo(cx + 10, cy);
+          ctx.stroke();
+          ctx.restore();
+
+          // Grid lines
+          ctx.save();
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+          ctx.lineWidth = Math.max(1, Math.min(2, Math.floor(canvas.width / 500)));
+          
+          for (let r = 0; r <= rows; r++) {
+            ctx.beginPath();
+            ctx.moveTo(startX, startY + r * cellH);
+            ctx.lineTo(startX + boxW, startY + r * cellH);
+            ctx.stroke();
+          }
+          for (let c = 0; c <= cols; c++) {
+            ctx.beginPath();
+            ctx.moveTo(startX + c * cellW, startY);
+            ctx.lineTo(startX + c * cellW, startY + boxH);
+            ctx.stroke();
+          }
+          ctx.restore();
+
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const data = imageData.data;
+          const samples: {r: number, c: number, b: number, px: number, py: number}[] = [];
+          
+          for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+              const px = Math.floor(startX + c * cellW + cellW / 2);
+              const py = Math.floor(startY + r * cellH + cellH / 2);
+              
+              if (px >= 0 && px < canvas.width && py >= 0 && py < canvas.height) {
+                const idx = (py * canvas.width + px) * 4;
+                const brightness = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+                samples.push({ r, c, b: brightness, px, py });
+              }
+            }
           }
           
-          // Draw center sampling dot
-          ctx.fillStyle = isBlock ? '#22c55e' : '#f43f5e';
-          ctx.beginPath();
-          ctx.arc(s.px, s.py, Math.max(2, Math.min(5, Math.floor(cellW / 10))), 0, Math.PI * 2);
-          ctx.fill();
-        }
-        
-        liveCellsRef.current = newCells;
+          const sorted = [...samples].sort((a, b) => a.b - b.b);
+          let maxGap = 0;
+          let baseThreshold = 60;
+          
+          if (sorted.length > 0) {
+            for (let i = 0; i < sorted.length - 1; i++) {
+              const gap = sorted[i+1].b - sorted[i].b;
+              if (gap > maxGap && i > sorted.length * 0.1 && i < sorted.length * 0.9) {
+                maxGap = gap;
+                baseThreshold = sorted[i].b + gap / 2;
+              }
+            }
+          }
 
-        // Throttle UI update of block count
-        const now = Date.now();
-        if (now - lastCountUpdateRef.current > 150) {
-          lastCountUpdateRef.current = now;
-          setLiveDetectedCount(newCells.size);
+          const threshold = Math.max(10, Math.min(245, baseThreshold + sensitivity));
+          const newCells = new Set<PointStr>();
+          
+          for (const s of samples) {
+            const isBlock = s.b > threshold;
+            if (isBlock) {
+              newCells.add(toStr({ r: s.r, c: s.c }));
+              ctx.fillStyle = 'rgba(56, 189, 248, 0.45)';
+              ctx.fillRect(startX + s.c * cellW + 2, startY + s.r * cellH + 2, cellW - 4, cellH - 4);
+            }
+            
+            ctx.fillStyle = isBlock ? '#22c55e' : '#f43f5e';
+            ctx.beginPath();
+            ctx.arc(s.px, s.py, Math.max(2, Math.min(5, Math.floor(cellW / 10))), 0, Math.PI * 2);
+            ctx.fill();
+          }
+          
+          liveCellsRef.current = newCells;
+          if (now - lastCountUpdateRef.current > 150) {
+            lastCountUpdateRef.current = now;
+            setLiveDetectedCount(newCells.size);
+          }
         }
       }
     }
@@ -827,7 +1029,7 @@ export default function GridPathSolver() {
             <button className={`btn join-item ${toolMode === 'paint' ? 'btn-neutral' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('paint')}>✏️ Paint</button>
             <button className={`btn join-item ${toolMode === 'start' ? 'btn-info text-info-content' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('start')}>🔵 Start</button>
             <button className={`btn join-item ${toolMode === 'end' ? 'btn-warning text-warning-content' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('end')}>🟧 End</button>
-            <button className="btn join-item btn-ghost border border-base-300 text-secondary font-semibold" onClick={() => startCamera()}>📷 Scan</button>
+            <button className="btn join-item btn-ghost border border-base-300 text-secondary font-semibold" onClick={() => { autoCapturedRef.current = false; startCamera(); }}>📷 Scan</button>
           </div>
         </div>
 
@@ -942,38 +1144,70 @@ export default function GridPathSolver() {
           </div>
         </div>
         
-        {/* Live Camera Overlay with Real-time Calibration */}
+        {/* Live Camera Overlay with Auto-Detect OpenCV & Manual Calibration */}
         {isCameraActive && (
           <div className="fixed inset-0 z-50 bg-black flex flex-col select-none touch-none">
             {/* Top Navigation / Status Header */}
-            <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between p-3 md:p-4 bg-gradient-to-b from-black/80 via-black/40 to-transparent">
+            <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between p-3 md:p-4 bg-gradient-to-b from-black/90 via-black/50 to-transparent">
               <div className="flex items-center gap-2">
-                <span className="badge badge-info badge-lg font-bold shadow-md">
-                  🔍 {Math.round(scanScale * 100)}%
-                </span>
-                {(scanOffsetX !== 0 || scanOffsetY !== 0 || scanScale !== 1 || scanWidthScale !== 1 || scanHeightScale !== 1) && (
+                {/* Mode Selector */}
+                <div className="join bg-black/60 backdrop-blur-md p-0.5 rounded-xl border border-white/15">
                   <button 
-                    className="btn btn-xs btn-outline btn-warning rounded-full gap-1 shadow"
-                    onClick={resetScanParams}
-                    title="Reset position and zoom"
+                    className={`btn btn-xs join-item ${scanMode === 'auto' ? 'btn-primary font-bold shadow' : 'btn-ghost text-white/80'}`}
+                    onClick={() => setScanMode('auto')}
                   >
-                    🔄 รีเซ็ต
+                    🤖 Auto AI
+                  </button>
+                  <button 
+                    className={`btn btn-xs join-item ${scanMode === 'manual' ? 'btn-primary font-bold shadow' : 'btn-ghost text-white/80'}`}
+                    onClick={() => setScanMode('manual')}
+                  >
+                    🖐️ ปรับมือ
+                  </button>
+                </div>
+
+                {scanMode === 'auto' && (
+                  <button 
+                    className={`btn btn-xs rounded-full gap-1 ${autoSnap ? 'btn-success text-success-content font-bold' : 'btn-neutral text-white/80 border border-white/20'}`}
+                    onClick={() => setAutoSnap(prev => !prev)}
+                    title="Auto-Snap when locked"
+                  >
+                    ⚡ Auto-Snap: {autoSnap ? 'ON' : 'OFF'}
                   </button>
                 )}
               </div>
 
-              <div className="hidden sm:flex items-center bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-xs text-white/80 border border-white/10 shadow">
-                <span>👆 ลากเพื่อเลื่อน • 🤏 บีบขยาย • ดับเบิลคลิกเพื่อรีเซ็ต</span>
+              {/* Status Indicator */}
+              <div className="hidden sm:flex items-center gap-2">
+                {scanMode === 'auto' ? (
+                  <span className={`badge badge-md font-bold px-3 py-2 border shadow ${
+                    detectionStatus === 'locked' 
+                      ? 'badge-success border-success text-white animate-pulse' 
+                      : detectionStatus === 'tracking'
+                      ? 'badge-info border-info text-white'
+                      : 'badge-neutral bg-black/60 text-white/80 border-white/20'
+                  }`}>
+                    {detectionStatus === 'locked' && '🎯 ล็อกเป้าหมายสำเร็จ! (Locked)'}
+                    {detectionStatus === 'tracking' && `🟡 เจอบอร์ดเกม (${lockProgress}%)`}
+                    {detectionStatus === 'searching' && '🔴 ส่องกล้องไปที่บอร์ดเกม...'}
+                  </span>
+                ) : (
+                  <span className="badge badge-info badge-md font-bold">
+                    🔍 ซูม {Math.round(scanScale * 100)}%
+                  </span>
+                )}
               </div>
 
               <div className="flex items-center gap-2">
-                <button 
-                  className={`btn btn-sm btn-circle ${showAdvancedScan ? 'btn-primary' : 'btn-neutral text-white'} border border-white/20 shadow`}
-                  onClick={() => setShowAdvancedScan(prev => !prev)}
-                  title="Calibration Settings"
-                >
-                  ⚙️
-                </button>
+                {scanMode === 'manual' && (
+                  <button 
+                    className={`btn btn-sm btn-circle ${showAdvancedScan ? 'btn-primary' : 'btn-neutral text-white'} border border-white/20 shadow`}
+                    onClick={() => setShowAdvancedScan(prev => !prev)}
+                    title="Calibration Settings"
+                  >
+                    ⚙️
+                  </button>
+                )}
                 <button 
                   className="btn btn-sm btn-circle btn-neutral text-white border border-white/20 shadow"
                   onClick={toggleCamera}
@@ -991,7 +1225,7 @@ export default function GridPathSolver() {
               </div>
             </div>
 
-            {/* Viewport with Canvas & Touch/Mouse Gestures */}
+            {/* Viewport with Canvas & Gestures */}
             <div 
               className="relative flex-1 bg-black overflow-hidden flex items-center justify-center cursor-grab active:cursor-grabbing"
               onTouchStart={handleCamTouchStart}
@@ -1015,14 +1249,20 @@ export default function GridPathSolver() {
                 className="absolute inset-0 w-full h-full object-contain pointer-events-none"
               />
 
-              {/* Floating Mobile Hint */}
-              <div className="sm:hidden absolute top-16 pointer-events-none bg-black/50 backdrop-blur-sm px-3 py-1 rounded-full text-[11px] text-white/70 border border-white/10">
-                ลากเพื่อย้าย • บีบเพื่อปรับขนาด
+              {/* Floating Mobile Status */}
+              <div className="sm:hidden absolute top-16 pointer-events-none bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-xs text-white/90 border border-white/15">
+                {scanMode === 'auto' ? (
+                  detectionStatus === 'locked' ? '🎯 ล็อกเป้าหมายสำเร็จ!' :
+                  detectionStatus === 'tracking' ? `🟡 กำลังล็อกบอร์ด (${lockProgress}%)` :
+                  '🔴 ส่องกล้องไปที่บอร์ดเกม...'
+                ) : (
+                  'ลากเพื่อเลื่อน • บีบเพื่อปรับขนาด'
+                )}
               </div>
             </div>
 
-            {/* Collapsible Advanced Calibration Panel */}
-            {showAdvancedScan && (
+            {/* Collapsible Advanced Calibration Panel (in Manual Mode) */}
+            {showAdvancedScan && scanMode === 'manual' && (
               <div className="bg-neutral-900/95 backdrop-blur-xl border-t border-white/15 p-4 z-20 max-h-[45vh] overflow-y-auto shadow-2xl transition-all animate-fadeIn">
                 <div className="max-w-xl mx-auto space-y-3">
                   <div className="flex items-center justify-between border-b border-white/10 pb-2">
@@ -1123,49 +1363,49 @@ export default function GridPathSolver() {
               </div>
             )}
 
-            {/* Quick Real-Time Zoom & Scale Controller */}
-            <div className="bg-neutral-900/90 backdrop-blur-md border-t border-white/10 px-4 py-3 z-10">
-              <div className="max-w-xl mx-auto space-y-2">
-                {/* Preset Zoom Pills */}
-                <div className="flex items-center justify-between gap-1 overflow-x-auto pb-1">
-                  <span className="text-xs font-bold text-white/70 whitespace-nowrap mr-1">🔍 ซูม:</span>
-                  {[0.5, 0.75, 1.0, 1.25, 1.5, 1.8].map((preset) => (
-                    <button
-                      key={preset}
-                      className={`btn btn-xs rounded-lg flex-1 ${Math.abs(scanScale - preset) < 0.03 ? 'btn-primary font-bold' : 'btn-neutral bg-white/10 text-white/90 border-0'}`}
-                      onClick={() => setScanParam('scale', preset)}
-                    >
-                      {Math.round(preset * 100)}%
-                    </button>
-                  ))}
-                </div>
+            {/* Controls Bar for Manual Mode */}
+            {scanMode === 'manual' && (
+              <div className="bg-neutral-900/90 backdrop-blur-md border-t border-white/10 px-4 py-3 z-10">
+                <div className="max-w-xl mx-auto space-y-2">
+                  <div className="flex items-center justify-between gap-1 overflow-x-auto pb-1">
+                    <span className="text-xs font-bold text-white/70 whitespace-nowrap mr-1">🔍 ซูม:</span>
+                    {[0.5, 0.75, 1.0, 1.25, 1.5, 1.8].map((preset) => (
+                      <button
+                        key={preset}
+                        className={`btn btn-xs rounded-lg flex-1 ${Math.abs(scanScale - preset) < 0.03 ? 'btn-primary font-bold' : 'btn-neutral bg-white/10 text-white/90 border-0'}`}
+                        onClick={() => setScanParam('scale', preset)}
+                      >
+                        {Math.round(preset * 100)}%
+                      </button>
+                    ))}
+                  </div>
 
-                {/* Main Scale Slider with - / + buttons */}
-                <div className="flex items-center gap-3">
-                  <button 
-                    className="btn btn-xs btn-circle btn-neutral bg-white/10 border-0 text-white font-bold"
-                    onClick={() => setScanParam('scale', Math.max(0.25, parseFloat((scanScale - 0.05).toFixed(2))))}
-                  >
-                    −
-                  </button>
-                  <input 
-                    type="range" 
-                    min="0.25" 
-                    max="2.2" 
-                    step="0.01" 
-                    value={scanScale} 
-                    onChange={(e) => setScanParam('scale', parseFloat(e.target.value))}
-                    className="range range-sm range-primary flex-1" 
-                  />
-                  <button 
-                    className="btn btn-xs btn-circle btn-neutral bg-white/10 border-0 text-white font-bold"
-                    onClick={() => setScanParam('scale', Math.min(2.2, parseFloat((scanScale + 0.05).toFixed(2))))}
-                  >
-                    +
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <button 
+                      className="btn btn-xs btn-circle btn-neutral bg-white/10 border-0 text-white font-bold"
+                      onClick={() => setScanParam('scale', Math.max(0.25, parseFloat((scanScale - 0.05).toFixed(2))))}
+                    >
+                      −
+                    </button>
+                    <input 
+                      type="range" 
+                      min="0.25" 
+                      max="2.2" 
+                      step="0.01" 
+                      value={scanScale} 
+                      onChange={(e) => setScanParam('scale', parseFloat(e.target.value))}
+                      className="range range-sm range-primary flex-1" 
+                    />
+                    <button 
+                      className="btn btn-xs btn-circle btn-neutral bg-white/10 border-0 text-white font-bold"
+                      onClick={() => setScanParam('scale', Math.min(2.2, parseFloat((scanScale + 0.05).toFixed(2))))}
+                    >
+                      +
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
 
             {/* Bottom Action Footer */}
             <div 
@@ -1177,18 +1417,20 @@ export default function GridPathSolver() {
               </button>
 
               <div className="flex items-center gap-2">
-                <button 
-                  className={`btn btn-sm ${showAdvancedScan ? 'btn-primary' : 'btn-ghost text-white/80 border border-white/20'}`}
-                  onClick={() => setShowAdvancedScan(prev => !prev)}
-                >
-                  ⚙️ {showAdvancedScan ? 'ซ่อนตั้งค่า' : 'ปรับเลนส์'}
-                </button>
+                {scanMode === 'manual' && (
+                  <button 
+                    className={`btn btn-sm ${showAdvancedScan ? 'btn-primary' : 'btn-ghost text-white/80 border border-white/20'}`}
+                    onClick={() => setShowAdvancedScan(prev => !prev)}
+                  >
+                    ⚙️ {showAdvancedScan ? 'ซ่อนตั้งค่า' : 'ปรับเลนส์'}
+                  </button>
+                )}
 
                 <button 
-                  className="btn btn-primary btn-md md:btn-lg shadow-xl shadow-primary/40 font-bold text-base px-6 gap-2"
+                  className={`btn ${detectionStatus === 'locked' && scanMode === 'auto' ? 'btn-success text-white animate-bounce' : 'btn-primary'} btn-md md:btn-lg shadow-xl shadow-primary/40 font-bold text-base px-6 gap-2`}
                   onClick={confirmScan}
                 >
-                  <span>📸 ถ่ายรูป</span>
+                  <span>📸 {scanMode === 'auto' ? 'ถ่ายรูป (Auto AI)' : 'ถ่ายรูป'}</span>
                   <span className="badge badge-neutral text-xs font-mono font-bold bg-black/40 text-white border-0">
                     {liveDetectedCount} บล็อก
                   </span>
