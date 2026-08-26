@@ -9,7 +9,11 @@ import {
   smoothQuad, 
   getQuadMovement, 
   mapGridToImage, 
-  QuadCorners 
+  detectBlockGrid,
+  detectionSignature,
+  cellCornerToImage,
+  QuadCorners,
+  BlockGridDetection
 } from '@/utils/cvScanner';
 
 // Default layout from original Python code
@@ -142,6 +146,17 @@ export default function GridPathSolver() {
 
   const lastDetectedQuadRef = useRef<QuadCorners | null>(null);
   const stabilityFramesRef = useRef<number>(0);
+
+  // Block-lattice detection (primary auto mode)
+  const [detectedGrid, setDetectedGrid] = useState<{ rows: number; cols: number } | null>(null);
+  const blockDetRef = useRef<BlockGridDetection | null>(null);
+  const lastBlockScanRef = useRef<number>(0);
+  const blockSigRef = useRef<string>('');
+  const blockStableRef = useRef<number>(0);
+  const blockMissRef = useRef<number>(0);
+  const pendingGridRef = useRef<{ rows: number; cols: number; start: PointStr | null } | null>(null);
+
+  const BLOCK_LOCK_FRAMES = 6;
   const autoCapturedRef = useRef<boolean>(false);
   const searchRadarAngleRef = useRef<number>(0);
 
@@ -472,7 +487,24 @@ export default function GridPathSolver() {
     setSolution(null);
   };
 
+  const resetDetectorState = () => {
+    blockDetRef.current = null;
+    blockSigRef.current = '';
+    blockStableRef.current = 0;
+    blockMissRef.current = 0;
+    lastBlockScanRef.current = 0;
+    pendingGridRef.current = null;
+    lastDetectedQuadRef.current = null;
+    stabilityFramesRef.current = 0;
+    liveCellsRef.current = new Set();
+    setDetectedGrid(null);
+    setLiveDetectedCount(0);
+    setLockProgress(0);
+    setDetectionStatus('searching');
+  };
+
   const startCamera = async (overrideFacing?: 'environment' | 'user') => {
+    resetDetectorState();
     setIsCameraActive(true);
     const targetFacing = (overrideFacing === 'environment' || overrideFacing === 'user') ? overrideFacing : facingMode;
     try {
@@ -608,6 +640,186 @@ export default function GridPathSolver() {
     setScanParam('scale', parseFloat(newScale.toFixed(2)));
   };
 
+  /**
+   * Draw the live OpenCV preview: detected blocks, the inferred lattice and
+   * the auto-detected start cell.
+   */
+  const drawBlockOverlay = (
+    ctx: CanvasRenderingContext2D,
+    canvas: HTMLCanvasElement,
+    det: BlockGridDetection,
+    stable: number
+  ) => {
+    const locked = stable >= BLOCK_LOCK_FRAMES;
+    const accent = locked ? '#22c55e' : '#38bdf8';
+    const unit = Math.hypot(det.ex.x, det.ex.y);
+    const lineW = Math.max(1.5, canvas.width / 900);
+
+    ctx.save();
+
+    // Lattice
+    ctx.strokeStyle = locked ? 'rgba(34, 197, 94, 0.45)' : 'rgba(255, 255, 255, 0.35)';
+    ctx.lineWidth = lineW;
+    for (let r = 0; r <= det.rows; r++) {
+      const a = cellCornerToImage(det, r, 0);
+      const b = cellCornerToImage(det, r, det.cols);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+    for (let c = 0; c <= det.cols; c++) {
+      const a = cellCornerToImage(det, 0, c);
+      const b = cellCornerToImage(det, det.rows, c);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+
+    // Detected blocks
+    const half = unit * 0.38;
+    for (const block of det.blocks) {
+      ctx.fillStyle = locked ? 'rgba(34, 197, 94, 0.28)' : 'rgba(56, 189, 248, 0.26)';
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = lineW;
+      ctx.beginPath();
+      const radius = Math.max(2, half * 0.35);
+      const x = block.cx - half;
+      const y = block.cy - half;
+      const size = half * 2;
+      if (typeof ctx.roundRect === 'function') {
+        ctx.roundRect(x, y, size, size, radius);
+      } else {
+        ctx.rect(x, y, size, size);
+      }
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    // Auto-detected start cell
+    if (det.startCell) {
+      const startBlock = det.blocks.find(b => b.r === det.startCell!.r && b.c === det.startCell!.c);
+      if (startBlock) {
+        ctx.strokeStyle = '#facc15';
+        ctx.lineWidth = lineW * 2.2;
+        ctx.shadowColor = '#facc15';
+        ctx.shadowBlur = 14;
+        ctx.beginPath();
+        ctx.arc(startBlock.cx, startBlock.cy, half * 1.05, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#facc15';
+        ctx.font = `bold ${Math.max(12, Math.round(unit * 0.34))}px system-ui, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText('START', startBlock.cx, startBlock.cy - half * 1.4);
+      }
+    }
+
+    // Outer bracket + readout
+    const tl = cellCornerToImage(det, 0, 0);
+    const tr = cellCornerToImage(det, 0, det.cols);
+    const br = cellCornerToImage(det, det.rows, det.cols);
+    const bl = cellCornerToImage(det, det.rows, 0);
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = lineW * 2.4;
+    ctx.shadowColor = accent;
+    ctx.shadowBlur = locked ? 16 : 6;
+    ctx.beginPath();
+    ctx.moveTo(tl.x, tl.y);
+    ctx.lineTo(tr.x, tr.y);
+    ctx.lineTo(br.x, br.y);
+    ctx.lineTo(bl.x, bl.y);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    const label = `${det.rows} x ${det.cols}  -  ${det.cells.length} blocks`;
+    const fontSize = Math.max(14, Math.round(canvas.width / 42));
+    ctx.font = `bold ${fontSize}px system-ui, sans-serif`;
+    ctx.textAlign = 'left';
+    const textW = ctx.measureText(label).width;
+    const boxX = Math.max(8, Math.min(tl.x, bl.x));
+    const boxY = Math.max(fontSize * 1.8, Math.min(tl.y, tr.y) - fontSize * 1.6);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+    ctx.fillRect(boxX - 8, boxY - fontSize, textW + 16, fontSize * 1.5);
+    ctx.fillStyle = accent;
+    ctx.fillText(label, boxX, boxY + fontSize * 0.2);
+
+    ctx.restore();
+  };
+
+  /**
+   * Primary auto mode: segment the individual blocks with OpenCV and infer the
+   * grid from them, so boards that are not a solid rectangle still work.
+   * Returns whether the frame was handled (and whether it triggered a capture).
+   */
+  const runBlockDetection = (
+    ctx: CanvasRenderingContext2D,
+    canvas: HTMLCanvasElement,
+    now: number
+  ): 'captured' | 'handled' | 'none' => {
+    const cv = (window as any).cv;
+    if (!cv || !cv.Mat) return 'none';
+
+    // Detection is the expensive part; the overlay is redrawn every frame from
+    // the latest result so the preview stays smooth.
+    if (now - lastBlockScanRef.current > 90) {
+      lastBlockScanRef.current = now;
+      const det = detectBlockGrid(canvas, { sensitivity: scanParamsRef.current.sensitivity });
+
+      if (det) {
+        const sig = detectionSignature(det);
+        if (sig === blockSigRef.current) {
+          blockStableRef.current = Math.min(20, blockStableRef.current + 1);
+        } else {
+          blockSigRef.current = sig;
+          blockStableRef.current = 1;
+        }
+        blockDetRef.current = det;
+        blockMissRef.current = 0;
+      } else {
+        blockMissRef.current += 1;
+        blockStableRef.current = Math.max(0, blockStableRef.current - 1);
+        if (blockMissRef.current > 5) {
+          blockDetRef.current = null;
+          blockSigRef.current = '';
+          blockStableRef.current = 0;
+        }
+      }
+    }
+
+    const det = blockDetRef.current;
+    if (!det) return 'none';
+
+    const stable = blockStableRef.current;
+    const locked = stable >= BLOCK_LOCK_FRAMES;
+    drawBlockOverlay(ctx, canvas, det, stable);
+
+    liveCellsRef.current = new Set(det.cells as PointStr[]);
+    pendingGridRef.current = {
+      rows: det.rows,
+      cols: det.cols,
+      start: det.startCell ? toStr(det.startCell) : null,
+    };
+
+    if (now - lastCountUpdateRef.current > 120) {
+      lastCountUpdateRef.current = now;
+      setLiveDetectedCount(det.cells.length);
+      setLockProgress(Math.min(100, Math.round((stable / BLOCK_LOCK_FRAMES) * 100)));
+      setDetectionStatus(locked ? 'locked' : 'tracking');
+      setDetectedGrid({ rows: det.rows, cols: det.cols });
+    }
+
+    if (locked && autoSnapRef.current && !autoCapturedRef.current) {
+      autoCapturedRef.current = true;
+      confirmScan();
+      return 'captured';
+    }
+
+    return 'handled';
+  };
+
   const processVideo = () => {
     if (!videoRef.current || !canvasRef.current) return;
     
@@ -623,7 +835,15 @@ export default function GridPathSolver() {
         const now = Date.now();
 
         if (scanModeRef.current === 'auto') {
-          // --- AUTO-DETECTION (OpenCV / Computer Vision) ---
+          // --- BLOCK-LATTICE DETECTION (preferred) ---
+          const blockResult = runBlockDetection(ctx, canvas, now);
+          if (blockResult === 'captured') return;
+          if (blockResult === 'handled') {
+            animationRef.current = requestAnimationFrame(processVideo);
+            return;
+          }
+
+          // --- FALLBACK: whole-board quad detection ---
           const expectedRatio = cols / rows;
           let detected: QuadCorners | null = null;
 
@@ -764,6 +984,7 @@ export default function GridPathSolver() {
             }
 
             liveCellsRef.current = newCells;
+            pendingGridRef.current = null;
             setLiveDetectedCount(newCells.size);
 
             // Auto-Snap Trigger!
@@ -942,6 +1163,7 @@ export default function GridPathSolver() {
           }
           
           liveCellsRef.current = newCells;
+          pendingGridRef.current = null;
           if (now - lastCountUpdateRef.current > 150) {
             lastCountUpdateRef.current = now;
             setLiveDetectedCount(newCells.size);
@@ -953,11 +1175,22 @@ export default function GridPathSolver() {
   };
 
   const confirmScan = () => {
-    setActiveCells(new Set(liveCellsRef.current));
-    setStart(null);
+    const cells = new Set(liveCellsRef.current);
+    const pending = pendingGridRef.current;
+
+    if (pending) {
+      setRows(pending.rows);
+      setCols(pending.cols);
+    }
+    setActiveCells(cells);
+    setStart(pending?.start && cells.has(pending.start) ? pending.start : null);
     setEnd(null);
     setSolution(null);
-    setStatus(`Scanned! Found ${liveCellsRef.current.size} blocks.`);
+    setStatus(
+      pending
+        ? `Scanned! ${pending.rows}x${pending.cols}, ${cells.size} blocks${pending.start ? ' (start detected)' : ''}.`
+        : `Scanned! Found ${cells.size} blocks.`
+    );
     playSound('solve');
     stopCamera();
   };
@@ -1154,13 +1387,13 @@ export default function GridPathSolver() {
                 <div className="join bg-black/60 backdrop-blur-md p-0.5 rounded-xl border border-white/15">
                   <button 
                     className={`btn btn-xs join-item ${scanMode === 'auto' ? 'btn-primary font-bold shadow' : 'btn-ghost text-white/80'}`}
-                    onClick={() => setScanMode('auto')}
+                    onClick={() => { resetDetectorState(); autoCapturedRef.current = false; setScanMode('auto'); }}
                   >
                     🤖 Auto AI
                   </button>
                   <button 
                     className={`btn btn-xs join-item ${scanMode === 'manual' ? 'btn-primary font-bold shadow' : 'btn-ghost text-white/80'}`}
-                    onClick={() => setScanMode('manual')}
+                    onClick={() => { resetDetectorState(); setScanMode('manual'); }}
                   >
                     🖐️ ปรับมือ
                   </button>
@@ -1187,8 +1420,8 @@ export default function GridPathSolver() {
                       ? 'badge-info border-info text-white'
                       : 'badge-neutral bg-black/60 text-white/80 border-white/20'
                   }`}>
-                    {detectionStatus === 'locked' && '🎯 ล็อกเป้าหมายสำเร็จ! (Locked)'}
-                    {detectionStatus === 'tracking' && `🟡 เจอบอร์ดเกม (${lockProgress}%)`}
+                    {detectionStatus === 'locked' && `🎯 ล็อกสำเร็จ!${detectedGrid ? ` ${detectedGrid.rows}×${detectedGrid.cols}` : ''}`}
+                    {detectionStatus === 'tracking' && `🟡 เจอบอร์ด${detectedGrid ? ` ${detectedGrid.rows}×${detectedGrid.cols}` : ''} (${lockProgress}%)`}
                     {detectionStatus === 'searching' && '🔴 ส่องกล้องไปที่บอร์ดเกม...'}
                   </span>
                 ) : (
@@ -1252,8 +1485,8 @@ export default function GridPathSolver() {
               {/* Floating Mobile Status */}
               <div className="sm:hidden absolute top-16 pointer-events-none bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-xs text-white/90 border border-white/15">
                 {scanMode === 'auto' ? (
-                  detectionStatus === 'locked' ? '🎯 ล็อกเป้าหมายสำเร็จ!' :
-                  detectionStatus === 'tracking' ? `🟡 กำลังล็อกบอร์ด (${lockProgress}%)` :
+                  detectionStatus === 'locked' ? `🎯 ล็อกสำเร็จ! ${detectedGrid ? `${detectedGrid.rows}×${detectedGrid.cols} • ` : ''}${liveDetectedCount} บล็อก` :
+                  detectionStatus === 'tracking' ? `🟡 กำลังล็อกบอร์ด ${detectedGrid ? `${detectedGrid.rows}×${detectedGrid.cols} ` : ''}(${lockProgress}%)` :
                   '🔴 ส่องกล้องไปที่บอร์ดเกม...'
                 ) : (
                   'ลากเพื่อเลื่อน • บีบเพื่อปรับขนาด'
