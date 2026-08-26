@@ -108,12 +108,83 @@ export default function GridPathSolver() {
   const dragSeen = useRef<Set<PointStr>>(new Set());
   const lastTouchTime = useRef<number>(0);
   
-  // Camera state
+  // Camera state & real-time grid adjustments
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [scanScale, setScanScale] = useState(1.0);
+  const [scanWidthScale, setScanWidthScale] = useState(1.0);
+  const [scanHeightScale, setScanHeightScale] = useState(1.0);
+  const [scanOffsetX, setScanOffsetX] = useState(0);
+  const [scanOffsetY, setScanOffsetY] = useState(0);
+  const [scanSensitivity, setScanSensitivity] = useState(0);
+  const [liveDetectedCount, setLiveDetectedCount] = useState(0);
+  const [showAdvancedScan, setShowAdvancedScan] = useState(false);
+
+  const scanParamsRef = useRef({
+    scale: 1.0,
+    widthScale: 1.0,
+    heightScale: 1.0,
+    offsetX: 0,
+    offsetY: 0,
+    sensitivity: 0,
+  });
+
+  const lastCountUpdateRef = useRef<number>(0);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationRef = useRef<number | null>(null);
   const liveCellsRef = useRef<Set<PointStr>>(new Set());
+
+  // Gestures ref
+  const touchStateRef = useRef<{
+    startX: number;
+    startY: number;
+    initialOffsetX: number;
+    initialOffsetY: number;
+    initialDistance: number;
+    initialScale: number;
+    isDragging: boolean;
+    isPinching: boolean;
+    lastTapTime: number;
+  }>({
+    startX: 0,
+    startY: 0,
+    initialOffsetX: 0,
+    initialOffsetY: 0,
+    initialDistance: 0,
+    initialScale: 1.0,
+    isDragging: false,
+    isPinching: false,
+    lastTapTime: 0,
+  });
+
+  // Helper to sync scan params real-time
+  const setScanParam = (key: keyof typeof scanParamsRef.current, value: number) => {
+    scanParamsRef.current[key] = value;
+    if (key === 'scale') setScanScale(value);
+    else if (key === 'widthScale') setScanWidthScale(value);
+    else if (key === 'heightScale') setScanHeightScale(value);
+    else if (key === 'offsetX') setScanOffsetX(value);
+    else if (key === 'offsetY') setScanOffsetY(value);
+    else if (key === 'sensitivity') setScanSensitivity(value);
+  };
+
+  const resetScanParams = () => {
+    scanParamsRef.current = {
+      scale: 1.0,
+      widthScale: 1.0,
+      heightScale: 1.0,
+      offsetX: 0,
+      offsetY: 0,
+      sensitivity: 0,
+    };
+    setScanScale(1.0);
+    setScanWidthScale(1.0);
+    setScanHeightScale(1.0);
+    setScanOffsetX(0);
+    setScanOffsetY(0);
+    setScanSensitivity(0);
+  };
 
   // Particles state
   const particleCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -369,11 +440,21 @@ export default function GridPathSolver() {
     setSolution(null);
   };
 
-  const startCamera = async () => {
+  const startCamera = async (overrideFacing?: 'environment' | 'user') => {
     setIsCameraActive(true);
+    const targetFacing = (overrideFacing === 'environment' || overrideFacing === 'user') ? overrideFacing : facingMode;
     try {
+      if (videoRef.current?.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' }
+        video: { 
+          facingMode: targetFacing,
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
       });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -384,6 +465,12 @@ export default function GridPathSolver() {
       alert("Could not access camera: " + err);
       setIsCameraActive(false);
     }
+  };
+
+  const toggleCamera = () => {
+    const nextFacing = facingMode === 'environment' ? 'user' : 'environment';
+    setFacingMode(nextFacing);
+    startCamera(nextFacing);
   };
 
   const stopCamera = () => {
@@ -399,6 +486,96 @@ export default function GridPathSolver() {
     setIsCameraActive(false);
   };
 
+  // Viewport Touch Gestures
+  const handleCamTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      const now = Date.now();
+      if (now - touchStateRef.current.lastTapTime < 350) {
+        // Double tap -> reset position & scale
+        resetScanParams();
+        touchStateRef.current.lastTapTime = 0;
+        return;
+      }
+      touchStateRef.current.lastTapTime = now;
+      touchStateRef.current.startX = e.touches[0].clientX;
+      touchStateRef.current.startY = e.touches[0].clientY;
+      touchStateRef.current.initialOffsetX = scanParamsRef.current.offsetX;
+      touchStateRef.current.initialOffsetY = scanParamsRef.current.offsetY;
+      touchStateRef.current.isDragging = true;
+      touchStateRef.current.isPinching = false;
+    } else if (e.touches.length === 2) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      touchStateRef.current.initialDistance = dist;
+      touchStateRef.current.initialScale = scanParamsRef.current.scale;
+      touchStateRef.current.isPinching = true;
+      touchStateRef.current.isDragging = false;
+    }
+  };
+
+  const handleCamTouchMove = (e: React.TouchEvent) => {
+    if (touchStateRef.current.isPinching && e.touches.length >= 2) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      if (touchStateRef.current.initialDistance > 0) {
+        const factor = dist / touchStateRef.current.initialDistance;
+        const newScale = Math.min(Math.max(touchStateRef.current.initialScale * factor, 0.25), 2.5);
+        setScanParam('scale', parseFloat(newScale.toFixed(2)));
+      }
+    } else if (touchStateRef.current.isDragging && e.touches.length === 1) {
+      const dx = e.touches[0].clientX - touchStateRef.current.startX;
+      const dy = e.touches[0].clientY - touchStateRef.current.startY;
+      const newOffX = Math.min(Math.max(touchStateRef.current.initialOffsetX + (dx / (window.innerWidth || 400)), -0.6), 0.6);
+      const newOffY = Math.min(Math.max(touchStateRef.current.initialOffsetY + (dy / (window.innerHeight || 600)), -0.6), 0.6);
+      setScanParam('offsetX', parseFloat(newOffX.toFixed(3)));
+      setScanParam('offsetY', parseFloat(newOffY.toFixed(3)));
+    }
+  };
+
+  const handleCamTouchEnd = () => {
+    touchStateRef.current.isDragging = false;
+    touchStateRef.current.isPinching = false;
+  };
+
+  // Mouse drag & scroll zoom support for desktop
+  const isMouseDownRef = useRef(false);
+  const mouseStartRef = useRef({ x: 0, y: 0, offX: 0, offY: 0 });
+
+  const handleCamMouseDown = (e: React.MouseEvent) => {
+    isMouseDownRef.current = true;
+    mouseStartRef.current = {
+      x: e.clientX,
+      y: e.clientY,
+      offX: scanParamsRef.current.offsetX,
+      offY: scanParamsRef.current.offsetY,
+    };
+  };
+
+  const handleCamMouseMove = (e: React.MouseEvent) => {
+    if (!isMouseDownRef.current) return;
+    const dx = e.clientX - mouseStartRef.current.x;
+    const dy = e.clientY - mouseStartRef.current.y;
+    const newOffX = Math.min(Math.max(mouseStartRef.current.offX + (dx / (window.innerWidth || 800)), -0.6), 0.6);
+    const newOffY = Math.min(Math.max(mouseStartRef.current.offY + (dy / (window.innerHeight || 800)), -0.6), 0.6);
+    setScanParam('offsetX', parseFloat(newOffX.toFixed(3)));
+    setScanParam('offsetY', parseFloat(newOffY.toFixed(3)));
+  };
+
+  const handleCamMouseUp = () => {
+    isMouseDownRef.current = false;
+  };
+
+  const handleCamWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    const delta = -e.deltaY * 0.0015;
+    const newScale = Math.min(Math.max(scanParamsRef.current.scale + delta, 0.25), 2.5);
+    setScanParam('scale', parseFloat(newScale.toFixed(2)));
+  };
+
   const processVideo = () => {
     if (!videoRef.current || !canvasRef.current) return;
     
@@ -408,45 +585,103 @@ export default function GridPathSolver() {
     if (video.readyState === video.HAVE_ENOUGH_DATA) {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (ctx) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         
         // Calculate a centered box for the grid based on its true aspect ratio
-        const padding = 20;
+        const padding = 24;
         const availableW = canvas.width - padding * 2;
         const availableH = canvas.height - padding * 2;
         const gridRatio = cols / rows;
         
-        let boxW = availableW;
-        let boxH = boxW / gridRatio;
+        let baseBoxW = availableW;
+        let baseBoxH = baseBoxW / gridRatio;
         
-        if (boxH > availableH) {
-          boxH = availableH;
-          boxW = boxH * gridRatio;
+        if (baseBoxH > availableH) {
+          baseBoxH = availableH;
+          baseBoxW = baseBoxH * gridRatio;
         }
+
+        // Apply real-time calibrated scale, aspect ratio and position offset
+        const { scale: sScale, widthScale: wScale, heightScale: hScale, offsetX: offX, offsetY: offY, sensitivity } = scanParamsRef.current;
         
-        const startX = (canvas.width - boxW) / 2;
-        const startY = (canvas.height - boxH) / 2;
+        const boxW = baseBoxW * sScale * wScale;
+        const boxH = baseBoxH * sScale * hScale;
+        
+        const startX = (canvas.width - boxW) / 2 + (offX * canvas.width);
+        const startY = (canvas.height - boxH) / 2 + (offY * canvas.height);
         const cellW = boxW / cols;
         const cellH = boxH / rows;
 
-        // Draw grid overlay
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-        ctx.lineWidth = 1;
+        // Draw modern outer grid frame with corner brackets
+        ctx.save();
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = Math.max(3, Math.min(6, Math.floor(canvas.width / 250)));
+        ctx.lineCap = 'round';
+        const bracketLen = Math.min(cellW, cellH, 30);
+
+        // Top-Left
+        ctx.beginPath();
+        ctx.moveTo(startX, startY + bracketLen);
+        ctx.lineTo(startX, startY);
+        ctx.lineTo(startX + bracketLen, startY);
+        ctx.stroke();
+
+        // Top-Right
+        ctx.beginPath();
+        ctx.moveTo(startX + boxW - bracketLen, startY);
+        ctx.lineTo(startX + boxW, startY);
+        ctx.lineTo(startX + boxW, startY + bracketLen);
+        ctx.stroke();
+
+        // Bottom-Left
+        ctx.beginPath();
+        ctx.moveTo(startX, startY + boxH - bracketLen);
+        ctx.lineTo(startX, startY + boxH);
+        ctx.lineTo(startX + bracketLen, startY + boxH);
+        ctx.stroke();
+
+        // Bottom-Right
+        ctx.beginPath();
+        ctx.moveTo(startX + boxW - bracketLen, startY + boxH);
+        ctx.lineTo(startX + boxW, startY + boxH);
+        ctx.lineTo(startX + boxW, startY + boxH - bracketLen);
+        ctx.stroke();
+        ctx.restore();
+
+        // Draw subtle center guide reticle
+        const cx = startX + boxW / 2;
+        const cy = startY + boxH / 2;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.4)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(cx - 10, cy);
+        ctx.lineTo(cx + 10, cy);
+        ctx.moveTo(cx, cy - 10);
+        ctx.lineTo(cx, cy + 10);
+        ctx.stroke();
+        ctx.restore();
+
+        // Draw grid overlay lines
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+        ctx.lineWidth = Math.max(1, Math.min(2, Math.floor(canvas.width / 500)));
         
-        for(let r = 0; r <= rows; r++) {
+        for (let r = 0; r <= rows; r++) {
           ctx.beginPath();
           ctx.moveTo(startX, startY + r * cellH);
           ctx.lineTo(startX + boxW, startY + r * cellH);
           ctx.stroke();
         }
-        for(let c = 0; c <= cols; c++) {
+        for (let c = 0; c <= cols; c++) {
           ctx.beginPath();
           ctx.moveTo(startX + c * cellW, startY);
           ctx.lineTo(startX + c * cellW, startY + boxH);
           ctx.stroke();
         }
+        ctx.restore();
 
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const data = imageData.data;
@@ -459,47 +694,57 @@ export default function GridPathSolver() {
             const px = Math.floor(startX + c * cellW + cellW / 2);
             const py = Math.floor(startY + r * cellH + cellH / 2);
             
-            const idx = (py * canvas.width + px) * 4;
-            const brightness = (data[idx] + data[idx+1] + data[idx+2]) / 3;
-            samples.push({ r, c, b: brightness, px, py });
-          }
-        }
-        
-        // Adaptive Thresholding: sort by brightness and find the biggest gap
-        samples.sort((a, b) => a.b - b.b);
-        let maxGap = 0;
-        let threshold = 60; // fallback
-        
-        if (samples.length > 0) {
-          for (let i = 0; i < samples.length - 1; i++) {
-            const gap = samples[i+1].b - samples[i].b;
-            // Ignore gaps at the very extremes (e.g. 1 dead pixel)
-            if (gap > maxGap && i > samples.length * 0.1 && i < samples.length * 0.9) {
-              maxGap = gap;
-              threshold = samples[i].b + gap / 2;
+            if (px >= 0 && px < canvas.width && py >= 0 && py < canvas.height) {
+              const idx = (py * canvas.width + px) * 4;
+              const brightness = (data[idx] + data[idx+1] + data[idx+2]) / 3;
+              samples.push({ r, c, b: brightness, px, py });
             }
           }
         }
         
+        // Adaptive Thresholding: sort by brightness and find the biggest gap
+        const sorted = [...samples].sort((a, b) => a.b - b.b);
+        let maxGap = 0;
+        let baseThreshold = 60; // fallback
+        
+        if (sorted.length > 0) {
+          for (let i = 0; i < sorted.length - 1; i++) {
+            const gap = sorted[i+1].b - sorted[i].b;
+            if (gap > maxGap && i > sorted.length * 0.1 && i < sorted.length * 0.9) {
+              maxGap = gap;
+              baseThreshold = sorted[i].b + gap / 2;
+            }
+          }
+        }
+
+        // Apply user sensitivity offset
+        const threshold = Math.max(10, Math.min(245, baseThreshold + sensitivity));
         const newCells = new Set<PointStr>();
         
         for (const s of samples) {
-          // If brightness is above the adaptive threshold, it's a block
-          if (s.b > threshold) {
+          const isBlock = s.b > threshold;
+          if (isBlock) {
             newCells.add(toStr({ r: s.r, c: s.c }));
-            // Draw highlight
-            ctx.fillStyle = 'rgba(61, 139, 253, 0.5)';
+            // Draw vibrant block highlight
+            ctx.fillStyle = 'rgba(56, 189, 248, 0.45)';
             ctx.fillRect(startX + s.c * cellW + 2, startY + s.r * cellH + 2, cellW - 4, cellH - 4);
           }
           
           // Draw center sampling dot
-          ctx.fillStyle = s.b > threshold ? '#4ade80' : '#ff4d4f';
+          ctx.fillStyle = isBlock ? '#22c55e' : '#f43f5e';
           ctx.beginPath();
-          ctx.arc(s.px, s.py, 2, 0, Math.PI * 2);
+          ctx.arc(s.px, s.py, Math.max(2, Math.min(5, Math.floor(cellW / 10))), 0, Math.PI * 2);
           ctx.fill();
         }
         
         liveCellsRef.current = newCells;
+
+        // Throttle UI update of block count
+        const now = Date.now();
+        if (now - lastCountUpdateRef.current > 150) {
+          lastCountUpdateRef.current = now;
+          setLiveDetectedCount(newCells.size);
+        }
       }
     }
     animationRef.current = requestAnimationFrame(processVideo);
@@ -582,7 +827,7 @@ export default function GridPathSolver() {
             <button className={`btn join-item ${toolMode === 'paint' ? 'btn-neutral' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('paint')}>✏️ Paint</button>
             <button className={`btn join-item ${toolMode === 'start' ? 'btn-info text-info-content' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('start')}>🔵 Start</button>
             <button className={`btn join-item ${toolMode === 'end' ? 'btn-warning text-warning-content' : 'btn-ghost border border-base-300'}`} onClick={() => setToolMode('end')}>🟧 End</button>
-            <button className="btn join-item btn-ghost border border-base-300 text-secondary font-semibold" onClick={startCamera}>📷 Scan</button>
+            <button className="btn join-item btn-ghost border border-base-300 text-secondary font-semibold" onClick={() => startCamera()}>📷 Scan</button>
           </div>
         </div>
 
@@ -697,10 +942,67 @@ export default function GridPathSolver() {
           </div>
         </div>
         
-        {/* Live Camera Overlay */}
+        {/* Live Camera Overlay with Real-time Calibration */}
         {isCameraActive && (
-          <div className="fixed inset-0 z-50 bg-black flex flex-col">
-            <div className="relative flex-1 bg-black overflow-hidden flex items-center justify-center">
+          <div className="fixed inset-0 z-50 bg-black flex flex-col select-none touch-none">
+            {/* Top Navigation / Status Header */}
+            <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between p-3 md:p-4 bg-gradient-to-b from-black/80 via-black/40 to-transparent">
+              <div className="flex items-center gap-2">
+                <span className="badge badge-info badge-lg font-bold shadow-md">
+                  🔍 {Math.round(scanScale * 100)}%
+                </span>
+                {(scanOffsetX !== 0 || scanOffsetY !== 0 || scanScale !== 1 || scanWidthScale !== 1 || scanHeightScale !== 1) && (
+                  <button 
+                    className="btn btn-xs btn-outline btn-warning rounded-full gap-1 shadow"
+                    onClick={resetScanParams}
+                    title="Reset position and zoom"
+                  >
+                    🔄 รีเซ็ต
+                  </button>
+                )}
+              </div>
+
+              <div className="hidden sm:flex items-center bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-xs text-white/80 border border-white/10 shadow">
+                <span>👆 ลากเพื่อเลื่อน • 🤏 บีบขยาย • ดับเบิลคลิกเพื่อรีเซ็ต</span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button 
+                  className={`btn btn-sm btn-circle ${showAdvancedScan ? 'btn-primary' : 'btn-neutral text-white'} border border-white/20 shadow`}
+                  onClick={() => setShowAdvancedScan(prev => !prev)}
+                  title="Calibration Settings"
+                >
+                  ⚙️
+                </button>
+                <button 
+                  className="btn btn-sm btn-circle btn-neutral text-white border border-white/20 shadow"
+                  onClick={toggleCamera}
+                  title="Switch Camera"
+                >
+                  🔄
+                </button>
+                <button 
+                  className="btn btn-sm btn-circle btn-ghost text-white/80 hover:text-white"
+                  onClick={stopCamera}
+                  title="Close Camera"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            {/* Viewport with Canvas & Touch/Mouse Gestures */}
+            <div 
+              className="relative flex-1 bg-black overflow-hidden flex items-center justify-center cursor-grab active:cursor-grabbing"
+              onTouchStart={handleCamTouchStart}
+              onTouchMove={handleCamTouchMove}
+              onTouchEnd={handleCamTouchEnd}
+              onMouseDown={handleCamMouseDown}
+              onMouseMove={handleCamMouseMove}
+              onMouseUp={handleCamMouseUp}
+              onMouseLeave={handleCamMouseUp}
+              onWheel={handleCamWheel}
+            >
               <video 
                 ref={videoRef} 
                 className="absolute inset-0 w-full h-full object-contain opacity-0 pointer-events-none" 
@@ -710,14 +1012,188 @@ export default function GridPathSolver() {
               />
               <canvas 
                 ref={canvasRef} 
-                className="absolute inset-0 w-full h-full object-contain"
+                className="absolute inset-0 w-full h-full object-contain pointer-events-none"
               />
+
+              {/* Floating Mobile Hint */}
+              <div className="sm:hidden absolute top-16 pointer-events-none bg-black/50 backdrop-blur-sm px-3 py-1 rounded-full text-[11px] text-white/70 border border-white/10">
+                ลากเพื่อย้าย • บีบเพื่อปรับขนาด
+              </div>
             </div>
-            
-            <div className="bg-base-300 p-6 flex justify-between items-center z-10 border-t border-base-100" style={{ paddingBottom: 'max(1.5rem, env(safe-area-inset-bottom))' }}>
-              <button className="btn btn-ghost text-error text-lg" onClick={stopCamera}>Cancel</button>
-              <p className="text-sm font-semibold opacity-80 max-w-[150px] text-center leading-tight">Line up grid with game</p>
-              <button className="btn btn-primary btn-lg shadow-lg shadow-primary/30" onClick={confirmScan}>Capture</button>
+
+            {/* Collapsible Advanced Calibration Panel */}
+            {showAdvancedScan && (
+              <div className="bg-neutral-900/95 backdrop-blur-xl border-t border-white/15 p-4 z-20 max-h-[45vh] overflow-y-auto shadow-2xl transition-all animate-fadeIn">
+                <div className="max-w-xl mx-auto space-y-3">
+                  <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                    <span className="font-bold text-sm text-primary flex items-center gap-1.5">
+                      ⚙️ ปรับแต่งเลนส์ & ตารางละเอียด (Calibration)
+                    </span>
+                    <button 
+                      className="btn btn-ghost btn-xs text-error font-semibold"
+                      onClick={resetScanParams}
+                    >
+                      คืนค่าเริ่มต้น
+                    </button>
+                  </div>
+
+                  {/* Rows / Cols Adjuster */}
+                  <div className="grid grid-cols-2 gap-3 bg-base-300/40 p-2.5 rounded-xl border border-white/5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold">แถว (Rows):</span>
+                      <div className="flex items-center gap-1">
+                        <button className="btn btn-xs btn-neutral" onClick={() => handleResize(Math.max(1, rows - 1), cols)}>-</button>
+                        <span className="font-bold text-sm w-6 text-center">{rows}</span>
+                        <button className="btn btn-xs btn-neutral" onClick={() => handleResize(rows + 1, cols)}>+</button>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold">คอลัมน์ (Cols):</span>
+                      <div className="flex items-center gap-1">
+                        <button className="btn btn-xs btn-neutral" onClick={() => handleResize(rows, Math.max(1, cols - 1))}>-</button>
+                        <span className="font-bold text-sm w-6 text-center">{cols}</span>
+                        <button className="btn btn-xs btn-neutral" onClick={() => handleResize(rows, cols + 1)}>+</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Width Scale Slider */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs font-medium">
+                      <span>↔️ สเกลแนวนอน (Width Stretch)</span>
+                      <span className="text-info font-bold">{Math.round(scanWidthScale * 100)}%</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button className="btn btn-xs btn-ghost" onClick={() => setScanParam('widthScale', Math.max(0.4, parseFloat((scanWidthScale - 0.05).toFixed(2))))}>-</button>
+                      <input 
+                        type="range" 
+                        min="0.4" 
+                        max="2.0" 
+                        step="0.02" 
+                        value={scanWidthScale} 
+                        onChange={(e) => setScanParam('widthScale', parseFloat(e.target.value))}
+                        className="range range-xs range-info flex-1" 
+                      />
+                      <button className="btn btn-xs btn-ghost" onClick={() => setScanParam('widthScale', Math.min(2.0, parseFloat((scanWidthScale + 0.05).toFixed(2))))}>+</button>
+                    </div>
+                  </div>
+
+                  {/* Height Scale Slider */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs font-medium">
+                      <span>↕️ สเกลแนวตั้ง (Height Stretch)</span>
+                      <span className="text-info font-bold">{Math.round(scanHeightScale * 100)}%</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button className="btn btn-xs btn-ghost" onClick={() => setScanParam('heightScale', Math.max(0.4, parseFloat((scanHeightScale - 0.05).toFixed(2))))}>-</button>
+                      <input 
+                        type="range" 
+                        min="0.4" 
+                        max="2.0" 
+                        step="0.02" 
+                        value={scanHeightScale} 
+                        onChange={(e) => setScanParam('heightScale', parseFloat(e.target.value))}
+                        className="range range-xs range-info flex-1" 
+                      />
+                      <button className="btn btn-xs btn-ghost" onClick={() => setScanParam('heightScale', Math.min(2.0, parseFloat((scanHeightScale + 0.05).toFixed(2))))}>+</button>
+                    </div>
+                  </div>
+
+                  {/* Threshold / Sensitivity Slider */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs font-medium">
+                      <span>💡 ความไวแสงตรวจจับบล็อก (Sensitivity)</span>
+                      <span className="text-success font-bold">{scanSensitivity > 0 ? `+${scanSensitivity}` : scanSensitivity}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button className="btn btn-xs btn-ghost" onClick={() => setScanParam('sensitivity', Math.max(-60, scanSensitivity - 5))}>-</button>
+                      <input 
+                        type="range" 
+                        min="-60" 
+                        max="60" 
+                        step="2" 
+                        value={scanSensitivity} 
+                        onChange={(e) => setScanParam('sensitivity', parseInt(e.target.value, 10))}
+                        className="range range-xs range-success flex-1" 
+                      />
+                      <button className="btn btn-xs btn-ghost" onClick={() => setScanParam('sensitivity', Math.min(60, scanSensitivity + 5))}>+</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Quick Real-Time Zoom & Scale Controller */}
+            <div className="bg-neutral-900/90 backdrop-blur-md border-t border-white/10 px-4 py-3 z-10">
+              <div className="max-w-xl mx-auto space-y-2">
+                {/* Preset Zoom Pills */}
+                <div className="flex items-center justify-between gap-1 overflow-x-auto pb-1">
+                  <span className="text-xs font-bold text-white/70 whitespace-nowrap mr-1">🔍 ซูม:</span>
+                  {[0.5, 0.75, 1.0, 1.25, 1.5, 1.8].map((preset) => (
+                    <button
+                      key={preset}
+                      className={`btn btn-xs rounded-lg flex-1 ${Math.abs(scanScale - preset) < 0.03 ? 'btn-primary font-bold' : 'btn-neutral bg-white/10 text-white/90 border-0'}`}
+                      onClick={() => setScanParam('scale', preset)}
+                    >
+                      {Math.round(preset * 100)}%
+                    </button>
+                  ))}
+                </div>
+
+                {/* Main Scale Slider with - / + buttons */}
+                <div className="flex items-center gap-3">
+                  <button 
+                    className="btn btn-xs btn-circle btn-neutral bg-white/10 border-0 text-white font-bold"
+                    onClick={() => setScanParam('scale', Math.max(0.25, parseFloat((scanScale - 0.05).toFixed(2))))}
+                  >
+                    −
+                  </button>
+                  <input 
+                    type="range" 
+                    min="0.25" 
+                    max="2.2" 
+                    step="0.01" 
+                    value={scanScale} 
+                    onChange={(e) => setScanParam('scale', parseFloat(e.target.value))}
+                    className="range range-sm range-primary flex-1" 
+                  />
+                  <button 
+                    className="btn btn-xs btn-circle btn-neutral bg-white/10 border-0 text-white font-bold"
+                    onClick={() => setScanParam('scale', Math.min(2.2, parseFloat((scanScale + 0.05).toFixed(2))))}
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Bottom Action Footer */}
+            <div 
+              className="bg-black/95 p-4 flex justify-between items-center z-10 border-t border-white/10"
+              style={{ paddingBottom: 'max(1.25rem, env(safe-area-inset-bottom))' }}
+            >
+              <button className="btn btn-ghost text-error text-base" onClick={stopCamera}>
+                ยกเลิก
+              </button>
+
+              <div className="flex items-center gap-2">
+                <button 
+                  className={`btn btn-sm ${showAdvancedScan ? 'btn-primary' : 'btn-ghost text-white/80 border border-white/20'}`}
+                  onClick={() => setShowAdvancedScan(prev => !prev)}
+                >
+                  ⚙️ {showAdvancedScan ? 'ซ่อนตั้งค่า' : 'ปรับเลนส์'}
+                </button>
+
+                <button 
+                  className="btn btn-primary btn-md md:btn-lg shadow-xl shadow-primary/40 font-bold text-base px-6 gap-2"
+                  onClick={confirmScan}
+                >
+                  <span>📸 ถ่ายรูป</span>
+                  <span className="badge badge-neutral text-xs font-mono font-bold bg-black/40 text-white border-0">
+                    {liveDetectedCount} บล็อก
+                  </span>
+                </button>
+              </div>
             </div>
           </div>
         )}
